@@ -1,0 +1,470 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  /* 默认值是深色。浅色只覆盖 :root[data-theme="light"]，避免两套 class。 */
+  --color-canvas: #08080a;
+  --color-rail: #0d0d0f;
+  --color-panel: #0d0d0f;
+  --color-console: #0a0a0c;
+  --color-elevated: #131318;
+  --color-card: #101014;
+  --color-card-live: #0f1a17;
+  --color-line: #1c1c1f;
+  --color-line-strong: #2e2e36;
+  --color-ink: #fafafa;
+  --color-ink-2: #e4e4e7;
+  --color-ink-3: #d4d4d8;
+  --color-mute: #a1a1aa;
+  --color-dim: #71717a;
+  --color-faint: #52525b;
+  --color-mint: #34d399;
+  --color-mint-2: #6ee7b7;
+  --color-mint-3: #a7f3d0;
+  --color-mint-4: #d1fae5;
+  --color-forest: #064e3b;
+  --color-forest-2: #065f46;
+  --color-danger: #f87171;
+  --color-danger-soft: #3f1d1d;
+  /* Prompt Input 用的语义色，跟着同一套主题走。 */
+  --color-background: #131318;
+  --color-foreground: #fafafa;
+  --color-primary: #064e3b;
+  --color-primary-foreground: #d1fae5;
+  --color-muted: #18181b;
+  --color-muted-foreground: #71717a;
+  --color-border: #2e2e36;
+  /* 原来散落在 class 里的近黑色面，收成令牌后浅色才能一起换。 */
+  --color-shell: #0b0b0c;
+  --color-well: #111114;
+  --color-field: #18181b;
+  --color-field-line: #27272a;
+  --color-row: #17171a;
+  --color-chip: #1e293b;
+  --color-code: #18181b;
+  --color-code-block: #0c0c0f;
+  --color-glow: #34d399;
+}
+
+/* 浅色是纸面，不是把深色面板提亮。薄荷绿降到能压在白底上的深度。 */
+:root[data-theme="light"] {
+  --color-canvas: #f4f4f5;
+  --color-rail: #ffffff;
+  --color-panel: #ffffff;
+  --color-console: #fafafa;
+  --color-elevated: #ffffff;
+  --color-card: #ffffff;
+  --color-card-live: #ecfdf5;
+  --color-line: #e4e4e7;
+  --color-line-strong: #d4d4d8;
+  --color-ink: #18181b;
+  --color-ink-2: #27272a;
+  --color-ink-3: #3f3f46;
+  --color-mute: #52525b;
+  --color-dim: #71717a;
+  --color-faint: #a1a1aa;
+  --color-mint: #047857;
+  --color-mint-2: #065f46;
+  --color-mint-3: #064e3b;
+  --color-mint-4: #022c22;
+  --color-forest: #d1fae5;
+  --color-forest-2: #6ee7b7;
+  --color-danger: #dc2626;
+  --color-danger-soft: #fee2e2;
+  --color-background: #ffffff;
+  --color-foreground: #18181b;
+  --color-primary: #047857;
+  --color-primary-foreground: #ffffff;
+  --color-muted: #f4f4f5;
+  --color-muted-foreground: #71717a;
+  --color-border: #e4e4e7;
+  --color-shell: #f4f4f5;
+  --color-well: #fafafa;
+  --color-field: #ffffff;
+  --color-field-line: #d4d4d8;
+  --color-row: #fafafa;
+  --color-chip: #f4f4f5;
+  --color-code: #f4f4f5;
+  --color-code-block: #fafafa;
+  --color-glow: #059669;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  /* 主题切换只过渡颜色，不位移。180ms 够看清换色，又不拖住下一次点击。 */
+  transition:
+    background-color 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    color 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 180ms cubic-bezier(0.16, 1, 0.3, 1);
+  /* 主题脚本会改 html 的 color-scheme；这里给没跑脚本时的原生控件一个深色底。 */
+  color-scheme: dark;
+}
+:root[data-theme="light"],
+:root[data-theme="light"] body {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+  /* 全局细滚动条：暗色滑块贴着现有面板色，避免 Windows 默认浅色粗条。 */
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 99px;
+  background: var(--color-line-strong);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-faint);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+button,
+textarea,
+input,
+select {
+  font-family: inherit;
+}
+
+/* 会话回答的 Markdown 预览，贴着现有暗色字色，不另起一套排版。 */
+.md-view {
+  overflow-wrap: anywhere;
+  color: var(--color-ink-2);
+  font-size: 14px;
+  line-height: 1.7;
+}
+.md-view > :first-child {
+  margin-top: 0;
+}
+.md-view > :last-child {
+  margin-bottom: 0;
+}
+.md-view p {
+  margin: 0.6em 0;
+}
+.md-view h1,
+.md-view h2,
+.md-view h3,
+.md-view h4 {
+  margin: 1em 0 0.4em;
+  color: var(--color-ink);
+  font-weight: 650;
+  line-height: 1.35;
+}
+.md-view h1 {
+  font-size: 1.25em;
+}
+.md-view h2 {
+  font-size: 1.12em;
+}
+.md-view h3,
+.md-view h4 {
+  font-size: 1em;
+}
+.md-view ul,
+.md-view ol {
+  margin: 0.5em 0;
+  padding-left: 1.25em;
+}
+.md-view ul {
+  list-style: disc;
+}
+.md-view ol {
+  list-style: decimal;
+}
+.md-view li {
+  margin: 0.2em 0;
+}
+.md-view a {
+  color: var(--color-mint-2);
+  text-underline-offset: 2px;
+}
+.md-view strong {
+  color: var(--color-ink);
+  font-weight: 650;
+}
+.md-view blockquote {
+  margin: 0.7em 0;
+  border-left: 2px solid var(--color-forest-2);
+  padding-left: 0.8em;
+  color: var(--color-mute);
+}
+.md-view code {
+  border-radius: 4px;
+  background: var(--color-code);
+  padding: 0.1em 0.35em;
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+}
+.md-view pre {
+  margin: 0.7em 0;
+  overflow-x: auto;
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  background: var(--color-code-block);
+  padding: 0.8em 1em;
+}
+.md-view pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.md-view hr {
+  margin: 1em 0;
+  border: 0;
+  border-top: 1px solid var(--color-line);
+}
+.md-view table {
+  width: 100%;
+  margin: 0.7em 0;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.md-view th,
+.md-view td {
+  border: 1px solid var(--color-line);
+  padding: 0.4em 0.6em;
+  text-align: left;
+}
+.md-view th {
+  background: var(--color-row);
+  color: var(--color-ink);
+  font-weight: 600;
+}
+.md-view img {
+  max-width: 100%;
+}
+
+/* 思考中的状态字。只动透明度，避免整块布局跳动。 */
+@keyframes sage-shimmer {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.sage-shimmer {
+  animation: sage-shimmer 1.4s ease-in-out infinite;
+}
+/* 执行清单进行中的图标。线性旋转，不改行高。 */
+@keyframes sage-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.sage-spin {
+  animation: sage-spin 0.8s linear infinite;
+}
+/* 流式回答末尾的插入符。只闪透明度，不改变行高。 */
+.sage-caret {
+  display: inline-block;
+  width: 2px;
+  height: 0.95em;
+  margin-left: 2px;
+  vertical-align: -0.12em;
+  border-radius: 1px;
+  background: var(--color-mint-2);
+  animation: sage-shimmer 0.9s ease-in-out infinite;
+}
+/* 完成动作在正文落定后浮出，对应 Streaming Response 的 actions 入场。 */
+@keyframes sage-actions-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.sage-actions {
+  animation: sage-actions-in 0.22s ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sage-shimmer,
+  .sage-caret,
+  .sage-spin,
+  .sage-actions {
+    animation: none;
+  }
+  /* 减少动态效果时颜色仍要过渡，只是缩短到几乎看不出等待。 */
+  html,
+  body,
+  #root {
+    transition-duration: 80ms;
+  }
+}
+
+.admin-input {
+  height: 32px;
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--color-field-line);
+  background: var(--color-field);
+  padding: 0 10px;
+  font-size: 11px;
+  color: var(--color-ink-2);
+  outline: none;
+  appearance: none;
+  color-scheme: inherit;
+}
+.admin-input:focus {
+  border-color: var(--color-forest-2);
+}
+.admin-input option {
+  background: var(--color-field);
+  color: var(--color-ink-2);
+}
+
+/* 原生 select 兜底：appearance 已去掉系统箭头，补回自定义 chevron，避免空白右侧。 */
+select.admin-input {
+  padding-right: 28px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 14px;
+}
+
+.ui-select {
+  position: relative;
+  width: 100%;
+}
+.ui-select-trigger {
+  display: flex;
+  height: 32px;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--color-field-line);
+  background: var(--color-field);
+  padding: 0 10px;
+  text-align: left;
+  font-size: 11px;
+  color: var(--color-ink-2);
+  outline: none;
+}
+.ui-select-trigger:focus-visible {
+  border-color: var(--color-forest-2);
+}
+.ui-select-trigger:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.ui-select-menu {
+  position: absolute;
+  z-index: 40;
+  margin-top: 4px;
+  max-height: 12rem;
+  width: 100%;
+  overflow-y: auto;
+  border-radius: 8px;
+  border: 1px solid var(--color-line);
+  background: var(--color-elevated);
+  padding: 4px;
+}
+/* 底边分页条没有向下的空间，菜单改挂在触发器上方。 */
+.ui-select-menu.is-top {
+  top: auto;
+  bottom: calc(100% + 4px);
+  margin-top: 0;
+}
+/* 顶部居中气泡：3s 生命周期，后段淡出，和 notify.ts 的卸除时间对齐。 */
+.toast-host {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  z-index: 80;
+  display: flex;
+  width: max-content;
+  max-width: min(440px, calc(100vw - 32px));
+  transform: translateX(-50%);
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+.toast-bubble {
+  max-width: 100%;
+  border-radius: 999px;
+  border: 1px solid var(--color-line-strong);
+  background: var(--color-elevated);
+  padding: 8px 14px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--color-ink-2);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+  opacity: 0;
+  transform: translateY(-8px);
+  /* 进出分开：进入 200ms，离开 180ms，走同一条向上的路径。 */
+  transition:
+    opacity 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    transform 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.toast-bubble[data-phase="in"] {
+  opacity: 1;
+  transform: none;
+  transition-duration: 200ms;
+}
+.toast-error {
+  border-color: rgb(248 113 113 / 45%);
+  color: var(--color-danger);
+}
+.toast-ok {
+  border-color: rgb(52 211 153 / 40%);
+  color: var(--color-mint-2);
+}
+
+.ui-select-option {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-radius: 6px;
+  padding: 6px 8px;
+  text-align: left;
+  font-size: 11px;
+  color: var(--color-ink-2);
+}
+.ui-select-option:hover,
+.ui-select-option[data-active="true"] {
+  background: var(--color-line);
+}
+.ui-select-option[data-selected="true"] {
+  background: color-mix(in srgb, var(--color-forest) 40%, transparent);
+  color: var(--color-mint-3);
+}
+.ui-select-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+.ui-select-empty {
+  padding: 8px;
+  font-size: 11px;
+  color: var(--color-dim);
+}
+
+
