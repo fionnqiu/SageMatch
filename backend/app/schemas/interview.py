@@ -67,3 +67,9 @@ class InterviewAnswerIn(BaseModel):
 class InterviewCreateIn(BaseModel):
     session_id: str | None = None
     question_set_id: str | None = None
+
+
+class InterviewGenerateIn(BaseModel):
+    """面试页单独出题。岗位描述不经过会话。"""
+
+    content: str = ""

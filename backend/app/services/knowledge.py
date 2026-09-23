@@ -132,8 +132,9 @@ def delete_material(db: Session, material_id: str) -> None:
     if not row:
         raise ValueError("物料不存在")
     name = row.filename
+    status = row.status
     db.delete(row)
-    audit(db, "material.delete", name, {})
+    audit(db, "material.delete", name, {"status": status})
     db.commit()
 
 

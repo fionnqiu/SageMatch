@@ -16,13 +16,13 @@ _WEIGHTS = {"llm": 0.7, "embedding": 0.2, "pattern": 0.1}
 _PATTERNS: dict[str, tuple[str, ...]] = {
     "answer": (r"^(你好|嗨|在吗|谢谢|你是谁)", r"(什么是|解释|区别|为什么|怎么理解)"),
     "clarify": (r"(哪一块|哪个方向|还是).*(还是|\?|？)",),
-    "generate_interview": (r"(岗位|jd|职位|招聘|出题|模拟面试|面试题)",),
+    "generate_interview": (r"(岗位|jd|职位|招聘|出题|模拟面试|面试题|生成.{0,12}面试)",),
 }
 
 _LEXICON: dict[str, tuple[str, ...]] = {
     "answer": ("你好", "什么", "解释", "区别", "原理"),
     "clarify": ("方向", "哪块", "还是", "选择"),
-    "generate_interview": ("岗位", "招聘", "职责", "出题", "模拟面试", "任职"),
+    "generate_interview": ("岗位", "招聘", "职责", "出题", "模拟面试", "任职", "生成"),
 }
 
 

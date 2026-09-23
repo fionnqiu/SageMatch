@@ -20,17 +20,15 @@ async def run_question_eval(db: Session, job_text: str) -> EvalRun:
     questions = payload.get("questions") or []
     stems = [q.get("stem") or "" for q in questions]
     dup = duplicate_rate(stems)
-    distractors = 0
-    for q in questions:
-        opts = q.get("options") or []
-        distractors += max(0, len(opts) - 1)
+    # A pack is usable only when every item can be asked out loud. Leftover choices fail the run.
+    spoken = sum(1 for q in questions if str(q.get("kind") or "open") in {"open", "scenario"} and not q.get("options"))
     coverage = float(payload.get("coverage") or 0.9)
     metrics = {
         "coverage": coverage,
         "duplicate_rate": dup,
-        "distractor_count": distractors,
         "question_count": len(questions),
-        "usable": len(questions) >= 5,
+        "spoken_count": spoken,
+        "usable": 8 <= len(questions) <= 12 and spoken == len(questions),
     }
     run = EvalRun(
         id=new_id(),

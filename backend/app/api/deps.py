@@ -36,7 +36,7 @@ def interview_out(item: Interview) -> schemas.InterviewOut:
         started_at=item.started_at,
         ended_at=item.ended_at,
         elapsed_seconds=item.elapsed_seconds,
-        tags=item.tags or [],
+        tags=_tag_list(item.tags),
         summary=item.summary,
         score=item.report.score if item.report else None,
         created_at=item.created_at,
@@ -58,10 +58,44 @@ def question_out(question) -> schemas.QuestionOut:
         id=question.id,
         ordinal=question.ordinal,
         stem=question.stem,
-        options=question.options or [],
+        options=_option_dicts(question.options),
         explanation=question.explanation,
         generated_by=question.generated_by,
     )
+
+
+def _tag_list(raw: object) -> list[str]:
+    """A pack once stored the whole focus line as one string. Split it instead of failing the list."""
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item).strip()]
+    if isinstance(raw, str) and raw.strip():
+        parts = [part.strip() for part in raw.replace("、", ",").split(",")]
+        return [part for part in parts if part]
+    return []
+
+
+def _option_dicts(raw: object) -> list[dict[str, str]]:
+    """Older packs stored each option as one string. The live page expects key and text."""
+    if not isinstance(raw, list):
+        return []
+    options: list[dict[str, str]] = []
+    for index, item in enumerate(raw):
+        if isinstance(item, dict):
+            key = str(item.get("key") or "")
+            text = str(item.get("text") or "")
+            if key or text:
+                options.append({"key": key, "text": text})
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        # "A. 正文" keeps the letter. A bare sentence gets the next letter.
+        key, _, rest = text.partition(".")
+        if len(key) == 1 and key.isalpha() and rest.strip():
+            options.append({"key": key, "text": rest.strip()})
+        else:
+            options.append({"key": chr(ord("A") + index), "text": text})
+    return options
 
 
 def provider_out(row: ProviderConfig) -> schemas.ProviderOut:

@@ -1,4 +1,4 @@
-"""Author and interviewer entry points. Services call these instead of one-shot prompts."""
+"""Author, critic, and interviewer entry points. Services call these instead of one-shot prompts."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.agents.contracts import profile_for
-from app.agents.loop import run_agent
+from app.agents.loop import run_agent, run_team
 from app.agents.memory import MemoryManager
 
 
@@ -17,23 +17,33 @@ async def author_questions(
     *,
     session_id: str | None = None,
     hits: list[dict[str, Any]] | None = None,
+    on_thought=None,
 ) -> dict[str, Any]:
-    """Run the author contract. Prefetched hits are context, not a live tool requirement."""
+    """Run the author, then one critic veto. Prefetched hits are context, not a live tool requirement."""
     memory = MemoryManager(db, session_id=session_id)
     context = memory.render()
     if hits:
         context += "\n\n[预取知识]\n" + "\n".join(str(hit.get("text") or "")[:200] for hit in hits[:4])
-    result = await run_agent(
-        db,
-        profile_for("author"),
-        user=(
-            "根据岗位描述生成 5 道选择题。finish.arguments 必须包含 job_title、summary、focus、"
-            "reply、questions（每题含 stem、options、answer、explanation）。"
-            f"\n岗位描述：\n{job_text[:3000]}"
-        ),
-        context=context,
-        seed={"hits": hits or []},
-    )
+    # The supervisor picks author, then critic. One veto comes back as a second team run.
+    objection = ""
+    result: dict[str, Any] = {}
+    verdict = {"pass": True, "reason": ""}
+    for attempt in range(2):
+        result = await run_team(
+            db,
+            ("author", "critic"),
+            user=_author_task(job_text, objection),
+            context=context,
+            seed={"hits": hits or []},
+            on_thought=on_thought,
+        )
+        output = result.get("output") or {}
+        if not output.get("questions"):
+            break
+        verdict = await _critic_verdict(db, output, on_thought=on_thought)
+        if verdict["pass"] or attempt == 1:
+            break
+        objection = verdict["reason"] or "题目未通过质检"
     output = result.get("output") or {}
     if output.get("questions"):
         memory.remember_profile(
@@ -41,7 +51,13 @@ async def author_questions(
             {"job_title": output.get("job_title") or "", "focus": output.get("focus") or []},
         )
         memory.update_episode(summary=str(output.get("summary") or "")[:400], slots={"question_count": len(output["questions"])})
-    output["_agent"] = {"ok": result.get("ok"), "steps": result.get("steps"), "observations": result.get("observations")}
+    output["_agent"] = {
+        "ok": result.get("ok"),
+        "steps": result.get("steps"),
+        "observations": result.get("observations"),
+        "verdict": "passed" if verdict["pass"] else "rejected",
+        "reason": verdict["reason"],
+    }
     return output
 
 
@@ -73,6 +89,52 @@ async def interviewer_followup(
         followups = int(slots.get("followups_on_question") or 0) + 1
         memory.advance_interview_slot(question_index=index, quote=answer, followups_on_question=followups)
     return text
+
+
+def review_pack(raw: dict[str, Any]) -> dict[str, Any]:
+    """Critic verdict only. Replacement questions are dropped before anyone can store them."""
+    return {"pass": bool(raw.get("pass")), "reason": str(raw.get("reason") or "")[:200]}
+
+
+def _author_task(job_text: str, objection: str) -> str:
+    """The rewrite sees the veto reason, never a question the critic tried to substitute.
+
+    The interview is a live conversation, so every question is spoken. Choices are not a kind.
+    """
+    task = (
+        "根据岗位描述生成一套实时对话模拟面试题，题量 8 到 12 道，按职责覆盖来定，不要固定成 5 道。"
+        "每条独立职责至少一题；职责少也不要少于 8 道，用追问深度补足，不要用同义重复凑数。"
+        "面试是实时对话，禁止选择题，也不要给选项。"
+        "讲方案、讲设计用 open；排查、权衡、故障用 scenario。kind 只能是这两个。"
+        "finish.arguments 必须包含 job_title、summary、focus、reply、questions。"
+        "每题含 kind、stem、answer、explanation，options 固定为空数组。"
+        "answer 写可核对的要点，不要写成单个字母。"
+        f"\n岗位描述：\n{job_text[:3000]}"
+    )
+    if objection:
+        task += f"\n上一套未通过质检，只重写，不要解释：{objection[:200]}"
+    return task
+
+
+async def _critic_verdict(db: Session, output: dict[str, Any], on_thought=None) -> dict[str, Any]:
+    """Ask for a pass/fail. Any questions in that payload are stripped by review_pack."""
+    questions = output.get("questions") or []
+    packed = "\n".join(
+        f"{index + 1}. {item.get('stem') or ''}｜解析：{item.get('explanation') or ''}"
+        for index, item in enumerate(questions)
+        if isinstance(item, dict)
+    )
+    result = await run_agent(
+        db,
+        profile_for("critic"),
+        user=(
+            "只判断是否通过。finish.arguments 只能有 pass 和 reason，不要返回题目。"
+            f"\n题目：\n{packed[:3000]}"
+        ),
+        seed={"questions": questions},
+        on_thought=on_thought,
+    )
+    return review_pack(result.get("output") or {})
 
 
 def _as_turns(turns: list[dict[str, str]]) -> list[Any]:

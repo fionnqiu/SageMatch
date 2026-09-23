@@ -67,7 +67,7 @@ async def chat(payload: schemas.ChatSendIn, db: Session = Depends(get_db)) -> sc
 
 @router.post("/api/chat/stream")
 async def chat_stream(payload: schemas.ChatSendIn, db: Session = Depends(get_db)) -> StreamingResponse:
-    """知识回答和追问逐块推送。澄清、出题没有正文增量，前端改回整段接口。"""
+    """知识回答和追问走这条流。澄清整段返回，出题请求只回 redirect。"""
     answers = [item.model_dump() for item in payload.answers]
     attachments = [item.model_dump() for item in payload.attachments]
     if not payload.content.strip() and not answers and not attachments:
@@ -75,6 +75,9 @@ async def chat_stream(payload: schemas.ChatSendIn, db: Session = Depends(get_db)
     mode = await services.chat_stream_mode(
         db, payload.content, payload.session_id, answers or None, attachments or None
     )
+    if mode == "redirect":
+        # 不写消息。前端直接打开面试页，避免会话里再落一条出题答复。
+        return StreamingResponse(_redirect_events(), media_type="text/event-stream", headers=_stream_headers())
     if mode != "stream":
         # 这里不写消息。前端收到 blocked 后改走 /api/chat，由整段接口落库。
         return StreamingResponse(_blocked_events(), media_type="text/event-stream", headers=_stream_headers())
@@ -89,15 +92,19 @@ async def _blocked_events() -> AsyncIterator[str]:
     yield _sse({"type": "blocked"})
 
 
+async def _redirect_events() -> AsyncIterator[str]:
+    yield _sse({"type": "redirect"})
+
+
 async def _fallback_events(db: Session, turn: dict) -> AsyncIterator[str]:
-    """预判能流、真正开始时却变成澄清或出题。沿用已写入的用户消息收尾。"""
+    """预判能流、真正开始时却变成澄清或改去面试页。沿用已写入的用户消息收尾。"""
     reply, extra = await services.complete_chat_turn(db, turn)
     session = await services.finish_chat(db, turn, reply, extra)
     yield _sse({"type": "done", "session": session_detail(session).model_dump(mode="json")})
 
 
 async def _answer_events(db: Session, turn: dict) -> AsyncIterator[str]:
-    """先给会话 id，再逐块给正文。收齐后落库，并把完整会话放进 done。"""
+    """先给会话 id，再逐块给思考和正文。思考收齐后才有回答字。"""
     extra = {**(turn.get("extra") or {}), "intent": turn["intent"]["intent"]}
     yield _sse({"type": "meta", "session_id": turn["session"].id, "extra": extra})
     answer: list[str] = []

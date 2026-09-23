@@ -3,6 +3,7 @@ import { AppShell } from "./layout/AppShell";
 import { AdminShell } from "./layout/AdminShell";
 import { SessionPage } from "./features/session/SessionPage";
 import { InterviewHubPage } from "./features/interview/InterviewHubPage";
+import { InterviewCreatePage } from "./features/interview/InterviewCreatePage";
 import { InterviewLivePage } from "./features/interview/InterviewLivePage";
 import { InterviewReportPage } from "./features/interview/InterviewReportPage";
 import { AdminProvidersPage } from "./features/admin/AdminProvidersPage";
@@ -17,6 +18,7 @@ export default function App() {
       <Route element={<AppShell />}>
         <Route path="/" element={<SessionPage />} />
         <Route path="/interview" element={<InterviewHubPage />} />
+        <Route path="/interview/new" element={<InterviewCreatePage />} />
         <Route path="/interview/:id" element={<InterviewLivePage />} />
         <Route path="/interview/:id/report" element={<InterviewReportPage />} />
       </Route>

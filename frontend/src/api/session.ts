@@ -47,6 +47,7 @@ export type ChatMessage = {
 
 export type ChatStreamEvent =
   | { type: "blocked" }
+  | { type: "redirect" }
   | { type: "meta"; session_id: string; extra?: ChatMessage["extra"] }
   | { type: "thinking"; text: string }
   | { type: "reasoning"; text: string }

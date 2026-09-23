@@ -4,14 +4,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from app.agents.authoring import author_questions, review_pack
 from app.agents.contracts import profile_for
 from app.agents.governance import FAILURE_THRESHOLD, ProviderGovernor
 from app.agents.intent_fusion import fuse_intent, pattern_intent
-from app.agents.loop import run_agent
+from app.agents.loop import run_agent, run_team
 from app.agents.memory import MemoryManager
 from app.agents.router import choose_provider
 from app.agents.tools import check_duplicate, validate_question
 from app.services.intent import resolve_intent
+from app.services.interview import write_report
 
 
 class _Row:
@@ -90,18 +92,52 @@ class Contracts(unittest.TestCase):
         profile = profile_for("author")
         self.assertTrue(profile.autonomous)
         self.assertEqual(profile.max_steps, 3)
+        # Eight to twelve mixed questions do not fit the old 1800-token pack.
+        self.assertGreaterEqual(profile.max_tokens, 3600)
         self.assertIn("hybrid_search", profile.tool_scope)
 
 
 class ToolRules(unittest.IsolatedAsyncioTestCase):
     async def test_validate_and_duplicate_are_deterministic(self) -> None:
-        bad = await validate_question(None, {"stem": "短", "options": []})
+        bad = await validate_question(None, {"stem": "短", "kind": "open", "options": []})
         self.assertFalse(bad["success"])
+        # Live interviews are spoken. A choice, or options on an open question, does not pass.
+        spoken = await validate_question(None, {"stem": "你会如何拆分模型调用和检索？", "kind": "open"})
+        self.assertTrue(spoken["success"])
+        choice = await validate_question(
+            None,
+            {"stem": "两级缓存的主要收益是什么？", "kind": "choice", "options": [{"key": "A", "text": "降延迟"}]},
+        )
+        self.assertFalse(choice["success"])
+        with_options = await validate_question(
+            None, {"stem": "你会如何拆分模型调用和检索？", "kind": "open", "options": [{"key": "A", "text": "拆三层"}]}
+        )
+        self.assertFalse(with_options["success"])
         dup = await check_duplicate(None, {"stems": ["缓存击穿后如何回源", "缓存击穿后如何回源保护"]})
         self.assertGreater(dup["duplicate_rate"], 0)
 
 
 class ToolLoop(unittest.IsolatedAsyncioTestCase):
+    async def test_supervisor_hands_authoring_to_the_named_roles(self) -> None:
+        """The team graph is a LangGraph supervisor, not the retired step loop."""
+        seen: list[tuple[str, ...]] = []
+
+        def fake_supervisor(db, roles, seed=None, on_thought=None):
+            del db, seed, on_thought
+            seen.append(tuple(roles))
+
+            class _Graph:
+                async def ainvoke(self, state, config=None):
+                    del state, config
+                    return {"messages": []}
+
+            return _Graph()
+
+        with patch("app.agents.loop.build_supervisor", new=fake_supervisor):
+            result = await run_team(_Db(), ("author", "critic"), user="出题")
+        self.assertEqual(seen, [("author", "critic")])
+        self.assertTrue(result["ok"])
+
     async def test_unknown_tool_is_rejected_then_finish_works(self) -> None:
         model = AsyncMock(
             side_effect=[
@@ -171,6 +207,93 @@ class MemoryLayers(unittest.TestCase):
         slots = memory.advance_interview_slot(question_index=0, quote="加了分布式锁", followups_on_question=1)
         self.assertEqual(slots["followups_on_question"], 1)
         self.assertTrue(any(getattr(row, "scope", "") == "interview" for row in db.added))
+
+
+def _question(stem: str) -> dict:
+    return {
+        "stem": stem,
+        "options": [{"key": "A", "text": "只让一个线程回源"}, {"key": "B", "text": "锁能保证强一致"}],
+        "answer": "A",
+        "explanation": "互斥锁限制的是并发回源，不是一致性方案。",
+    }
+
+
+class CriticGate(unittest.IsolatedAsyncioTestCase):
+    async def test_critic_rejects_without_rewriting_and_author_gets_one_more_try(self) -> None:
+        """A veto names the problem. It never returns a replacement question."""
+        rejected = {"questions": [_question("缓存"), _question("缓存")]}
+        accepted = {
+            "job_title": "后端",
+            "summary": "围绕缓存",
+            "focus": ["击穿"],
+            "reply": "已出题",
+            "questions": [_question("缓存击穿时为什么用互斥锁"), _question("看门狗为什么要续期")],
+        }
+
+        async def fake_run(_db, profile, **_kwargs):
+            # run_team receives the role pair. The critic call is still one role.
+            role = profile if isinstance(profile, str) else getattr(profile, "role", "")
+            if role == "critic":
+                return {"ok": True, "output": {"pass": False, "reason": "题干重复", "questions": [_question("被改写的题")]}}
+            if fake_run.calls:
+                return {"ok": True, "output": accepted}
+            fake_run.calls += 1
+            return {"ok": True, "output": rejected}
+
+        fake_run.calls = 0
+        with patch("app.agents.authoring.run_team", new=fake_run), patch(
+            "app.agents.authoring.run_agent", new=fake_run
+        ), patch(
+            "app.agents.authoring.MemoryManager", return_value=SimpleNamespace(render=lambda **_k: "", remember_profile=lambda *_a, **_k: None, update_episode=lambda **_k: None)
+        ):
+            result = await author_questions(object(), "后端岗位")
+        self.assertEqual(result["questions"], accepted["questions"])
+        self.assertEqual(result["_agent"]["verdict"], "rejected")
+        self.assertEqual(fake_run.calls, 1)
+
+    async def test_second_rejection_does_not_trigger_a_third_author_pass(self) -> None:
+        async def fake_run(_db, profile, **_kwargs):
+            # A team call passes the role tuple. A critic call passes one profile.
+            if isinstance(profile, tuple):
+                fake_run.roles.extend(profile)
+                return {"ok": True, "output": {"questions": [_question("缓存击穿时为什么用互斥锁")]}}
+            role = getattr(profile, "role", "")
+            fake_run.roles.append(role)
+            return {"ok": True, "output": {"pass": False, "reason": "缺解析"}}
+
+        fake_run.roles = []
+        with patch("app.agents.authoring.run_team", new=fake_run), patch(
+            "app.agents.authoring.run_agent", new=fake_run
+        ), patch(
+            "app.agents.authoring.MemoryManager", return_value=SimpleNamespace(render=lambda **_k: "", remember_profile=lambda *_a, **_k: None, update_episode=lambda **_k: None)
+        ):
+            await author_questions(object(), "后端岗位")
+        # The team hands both roles to the supervisor. The critic is asked once per attempt.
+        # Two team runs, and the critic is asked once after each. No third author pass.
+        self.assertEqual(fake_run.roles, ["author", "critic", "critic", "author", "critic", "critic"])
+
+    def test_critic_payload_cannot_carry_questions(self) -> None:
+        verdict = review_pack({"pass": False, "reason": "题干重复", "questions": [_question("替换题")]})
+        self.assertNotIn("questions", verdict)
+        self.assertFalse(verdict["pass"])
+
+
+class ScoreFreeze(unittest.IsolatedAsyncioTestCase):
+    async def test_coach_prose_cannot_replace_the_frozen_score(self) -> None:
+        """Scorer owns the number. A different score in the recap is ignored."""
+
+        async def fake_complete(_db, role, _system, _user, **_kwargs):
+            if role == "scorer":
+                return {"score": 71}
+            if role == "coach":
+                return {"score": 99, "review": "表述清楚，但缺少阈值。", "summary": "达到进一步", "issues": []}
+            raise AssertionError(role)
+
+        with patch("app.services.interview.complete", new=fake_complete), patch("app.llm.llm_available", return_value=True):
+            report = await write_report(object(), "后端场次", [{"role": "user", "content": "加了锁"}])
+        self.assertEqual(report["score"], 71)
+        self.assertEqual(report["review"], "表述清楚，但缺少阈值。")
+        self.assertNotIn("score", report["_coach"])
 
 
 class IntentFusion(unittest.IsolatedAsyncioTestCase):

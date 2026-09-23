@@ -1,4 +1,4 @@
-import { request } from "./http";
+import { readEventStream, request } from "./http";
 
 export type Question = {
   id: string;
@@ -43,9 +43,16 @@ export type Interview = {
   turns?: InterviewTurn[];
 };
 
+export type InterviewGenerateEvent =
+  | { type: "thought"; text: string }
+  | { type: "done"; interview: Pick<Interview, "id" | "title" | "status"> & Partial<Interview> }
+  | { type: "error"; message: string };
+
 export const interviewApi = {
   interviews: () => request<Interview[]>("/api/interviews"),
   interview: (id: string) => request<Interview>(`/api/interviews/${id}`),
+  generateInterview: (content: string, onEvent: (event: InterviewGenerateEvent) => void, signal?: AbortSignal) =>
+    readEventStream("/api/interviews/generate/stream", { content }, (event) => onEvent(event as InterviewGenerateEvent), signal),
   startInterview: (sessionId?: string) =>
     request<Interview>("/api/interviews", {
       method: "POST",
@@ -58,6 +65,8 @@ export const interviewApi = {
       body: JSON.stringify({ content, answer_mode: answerMode }),
     }),
   endInterview: (id: string) => request<Interview>(`/api/interviews/${id}/end`, { method: "POST" }),
+  // 直接退出。后端停表并结束场次，不排队写复盘。
+  abandonInterview: (id: string) => request<Interview>(`/api/interviews/${id}/abandon`, { method: "POST" }),
   deleteInterview: (id: string) => request<{ ok: string }>(`/api/interviews/${id}`, { method: "DELETE" }),
   downloadReport: (id: string) => {
     window.open(`/api/interviews/${id}/report.txt`, "_blank");

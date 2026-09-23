@@ -357,6 +357,71 @@ select {
 .sage-spin {
   animation: sage-spin 0.8s linear infinite;
 }
+
+/* 出题加载用 AICSS Orbs 的 M2：八点从中心扩成圆，再收回，舞台同时慢转。
+   坐标按 28px 舞台写，缩到 18px。不展示模型原文。 */
+.sage-morph {
+  position: relative;
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  overflow: hidden;
+  color: var(--color-mint-2);
+}
+.sage-morph-stage {
+  position: absolute;
+  inset: 0;
+  transform-origin: center;
+  animation: sage-morph-twist 9.6s linear infinite;
+}
+.sage-morph-dot {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  margin: -1.5px 0 0 -1.5px;
+  border-radius: 50%;
+  background: currentColor;
+  transform: scale(0.64);
+  animation: sage-morph 4.8s cubic-bezier(0.4, 0, 0.2, 1) infinite both;
+}
+@keyframes sage-morph {
+  0%,
+  5% {
+    transform: translate(var(--m-1)) scale(0.64);
+  }
+  25%,
+  30% {
+    transform: translate(var(--m-2)) scale(0.64);
+  }
+  50%,
+  55% {
+    transform: translate(var(--m-3)) scale(0.64);
+  }
+  75%,
+  80% {
+    transform: translate(var(--m-4)) scale(0.64);
+  }
+  100% {
+    transform: translate(var(--m-1)) scale(0.64);
+  }
+}
+@keyframes sage-morph-twist {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sage-morph-stage,
+  .sage-morph-dot {
+    animation: none;
+  }
+}
 /* 流式回答末尾的插入符。只闪透明度，不改变行高。 */
 /* 思考中的标签扫光。只动文字亮度，不改标签尺寸。 */
 .sage-think-shimmer {

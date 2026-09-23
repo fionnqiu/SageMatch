@@ -6,11 +6,16 @@ from app.services.eval import list_eval_runs, run_question_eval, run_score_eval
 from app.services.interview import (
     answer_interview,
     current_question,
+    abandon_interview,
+    build_report,
     delete_interview,
     end_interview,
+    finish_interview,
     get_interview,
     list_interviews,
+    prepare_interview,
     resume_or_start,
+    schedule_report,
     start_interview,
 )
 from app.services.knowledge import (
@@ -77,6 +82,7 @@ __all__ = [
     "list_call_logs",
     "list_eval_runs",
     "list_interviews",
+    "prepare_interview",
     "list_materials",
     "list_providers",
     "list_roles",
@@ -89,6 +95,7 @@ __all__ = [
     "resume_or_start",
     "run_question_eval",
     "run_score_eval",
+    "schedule_report",
     "seed_providers",
     "send_chat",
     "start_interview",

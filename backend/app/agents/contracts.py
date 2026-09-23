@@ -39,12 +39,13 @@ PROFILES: dict[str, AgentProfile] = {
     ),
     "author": AgentProfile(
         role="author",
-        mission="按岗位描述出题。可以检索、自检题干、查重，然后结束。",
+        mission="按岗位描述出问答题。实时对话，不出选择题。题量按职责覆盖，不固定 5 道。可以检索、自检题干、查重，然后结束。",
         autonomous=True,
         tool_scope=("hybrid_search", "validate_question", "check_duplicate", "finish"),
         max_steps=3,
         temperature=0.4,
-        max_tokens=1800,
+        # 8 到 12 道混合题的 JSON 放不进 1800。留出解析和参考要点。
+        max_tokens=3600,
         fallback_role="analyst",
     ),
     "critic": AgentProfile(

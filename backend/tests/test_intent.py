@@ -161,6 +161,29 @@ class ChatRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(extras[-1]["questions"][0]["prompt"], "你想被问哪一块？")
         self.assertNotIn("后端", str(extras[-1]))
 
+    async def test_named_interview_request_leaves_the_chat(self) -> None:
+        """「生成一场前端模拟面试」不再在会话里出题，只指向面试页。"""
+        db = _Db()
+        with (
+            patch("app.services.session.get_session", return_value=None),
+            patch("app.services.session.latest_question_set_for_session", return_value=None),
+            patch("app.services.session.ChatSession") as session_cls,
+            patch("app.services.session.ChatMessage") as message_cls,
+            patch("app.services.session.resolve_intent", new=AsyncMock()) as perceive,
+            patch("app.services.session.prepare_direct_answer", new=AsyncMock()) as answer,
+            patch("app.services.session.generate_and_store", new=AsyncMock()) as generate,
+            patch("app.services.session.now", return_value=None),
+        ):
+            session = session_cls.return_value
+            session.id = "s1"
+            session.messages = []
+            await send_chat(db, "帮我生成一个前端开发岗的模拟面试", None)
+        generate.assert_not_awaited()
+        answer.assert_not_awaited()
+        perceive.assert_not_awaited()
+        extras = [call.kwargs["extra"] for call in message_cls.call_args_list if "extra" in call.kwargs]
+        self.assertEqual(extras[-1]["kind"], "redirect")
+
     async def test_clarification_choice_is_decided_again(self) -> None:
         """Picking an option does not skip the model and force a question pack."""
         db = _Db()

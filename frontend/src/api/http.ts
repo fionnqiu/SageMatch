@@ -83,4 +83,13 @@ export async function readEventStream(
       onEvent(JSON.parse(data) as Record<string, unknown>);
     }
   }
+  // 连接被掐断时，最后一帧可能还留在缓冲区里。丢掉就会把已生成的结果当成失败。
+  const tail = buffer.trim();
+  if (!tail.startsWith("data:")) return;
+  const data = tail
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trim())
+    .join("\n");
+  if (data) onEvent(JSON.parse(data) as Record<string, unknown>);
 }

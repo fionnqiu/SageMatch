@@ -232,8 +232,9 @@ def delete_provider(db: Session, provider_id: str) -> None:
             binding.tts_provider_id = None
             binding.tts_model = ""
     name = row.name
+    protocol = row.protocol
     db.delete(row)
-    audit(db, "provider.delete", name, {})
+    audit(db, "provider.delete", name, {"protocol": protocol})
     db.commit()
 
 

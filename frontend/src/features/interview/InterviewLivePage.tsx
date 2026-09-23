@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { AudioLines, Hand, Keyboard, Mic, Sparkles, Square } from "lucide-react";
+import { AudioLines, Hand, Keyboard, LogOut, Mic, Sparkles, Square } from "lucide-react";
 import { api, type Interview } from "../../api";
-import { ThemeMenu } from "../../layout/ThemeMenu";
+import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { notify } from "../../lib/notify";
 
 function formatElapsed(seconds: number) {
@@ -39,6 +39,10 @@ export function InterviewLivePage() {
   const [listening, setListening] = useState(false);
   const [busy, setBusy] = useState(false);
   const [ending, setEnding] = useState(false);
+  const [leaving, setLeaving] = useState(false);
+  const [confirmLeave, setConfirmLeave] = useState(false);
+  // 选择结束并复盘后，计时锁在点击那一刻。后端停表返回前不再跑秒。
+  const [frozenElapsed, setFrozenElapsed] = useState<number | null>(null);
   const [speaking, setSpeaking] = useState(false);
   const started = useMemo(
     () => (interview?.started_at ? Date.parse(interview.started_at) : Date.now()),
@@ -142,19 +146,38 @@ export function InterviewLivePage() {
   }
 
   async function end() {
-    if (!id || ending) return;
+    if (!id || ending || leaving) return;
     interruptSpeech();
+    setFrozenElapsed(Math.max(0, Math.floor((Date.now() - started) / 1000)));
     setEnding(true);
     try {
       const next = await api.endInterview(id);
       navigate(`/interview/${next.id}/report`);
     } catch (err) {
       notify(err instanceof Error ? err.message : "无法结束面试", "error");
+      setFrozenElapsed(null);
       setEnding(false);
     }
   }
 
-  const elapsed = interview?.status === "live" ? Math.floor((now - started) / 1000) : interview?.elapsed_seconds || 0;
+  async function leave() {
+    if (!id || ending || leaving) return;
+    interruptSpeech();
+    setFrozenElapsed(Math.max(0, Math.floor((Date.now() - started) / 1000)));
+    setLeaving(true);
+    try {
+      await api.abandonInterview(id);
+      navigate("/interview", { replace: true });
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "无法退出面试", "error");
+      setFrozenElapsed(null);
+      setLeaving(false);
+    }
+  }
+
+  const elapsed =
+    frozenElapsed ??
+    (interview?.status === "live" ? Math.floor((now - started) / 1000) : interview?.elapsed_seconds || 0);
   const stageLabel = ending
     ? "正在生成复盘"
     : listening
@@ -182,11 +205,19 @@ export function InterviewLivePage() {
           <span className="text-[11px] text-dim">已用时</span>
           <span className="font-mono text-xl font-semibold">{formatElapsed(elapsed)}</span>
         </div>
-        <ThemeMenu />
+        <button
+          type="button"
+          onClick={() => setConfirmLeave(true)}
+          disabled={ending || leaving}
+          className="relative z-10 flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-line-strong bg-row px-4 py-2 text-xs disabled:cursor-wait disabled:opacity-50"
+        >
+          <LogOut size={14} className="text-mute" />
+          {leaving ? "正在退出…" : "退出"}
+        </button>
         <button
           type="button"
           onClick={end}
-          disabled={ending}
+          disabled={ending || leaving}
           className="relative z-10 flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-line-strong bg-row px-4 py-2 text-xs disabled:cursor-wait disabled:opacity-50"
         >
           <Square size={14} className="text-danger" />
@@ -225,15 +256,6 @@ export function InterviewLivePage() {
           <div className="space-y-2">
             <div className="text-[11px] font-medium text-mint">面试官 · 正在提问</div>
             <p className="text-xl font-medium leading-7 text-ink">{prompt || "题目将随提问出现"}</p>
-            {question?.options?.length ? (
-              <div className="space-y-1 text-xs text-mute">
-                {question.options.map((opt) => (
-                  <div key={opt.key}>
-                    {opt.key}. {opt.text}
-                  </div>
-                ))}
-              </div>
-            ) : null}
           </div>
           {lastUser ? (
             <div className="space-y-2">
@@ -292,6 +314,18 @@ export function InterviewLivePage() {
           <p className="text-[11px] text-faint">浏览器端语音识别 / TTS  ·  可随时打断</p>
         </div>
       </div>
+      <ConfirmDialog
+        open={confirmLeave}
+        title="退出面试"
+        body="退出后这场面试结束，不生成复盘。已用时会停在现在。"
+        confirmLabel="确认退出"
+        busyLabel="正在退出…"
+        busy={leaving}
+        onCancel={() => {
+          if (!leaving) setConfirmLeave(false);
+        }}
+        onConfirm={() => void leave()}
+      />
     </div>
   );
 }

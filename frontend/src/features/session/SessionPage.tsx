@@ -18,9 +18,6 @@ import { MarkdownView } from "../../components/MarkdownView";
 import { notify } from "../../lib/notify";
 import type { AppOutlet } from "./outlet";
 
-const SAMPLE_JD =
-  "目标岗位 JD：资深分布式系统架构师。主要职责为负责高并发消息队列引擎优化、海量缓存一致性保障、线上压测演练与故障应急治理。请为我提取岗位要求并出 5 道针对性实战题。";
-
 const abortControllers = new Set<AbortController>();
 
 type AskItem = {
@@ -94,6 +91,7 @@ export function SessionPage() {
     setBusy(true);
     try {
       let blocked = false;
+      let redirected = false;
       let streamed = "";
       let thought = "";
       let rationale = "";
@@ -103,6 +101,11 @@ export function SessionPage() {
         if (controller.signal.aborted) return;
         if (event.type === "blocked") {
           blocked = true;
+          return;
+        }
+        if (event.type === "redirect") {
+          // 出题不在会话里做。这条流没有落消息，直接去面试页。
+          redirected = true;
           return;
         }
         if (event.type === "meta") {
@@ -165,7 +168,6 @@ export function SessionPage() {
           finishedId = event.session.id;
           setCurrentId(event.session.id);
           // 正文已经按增量显示过。换成落库消息后直接标完成，避免再播一遍。
-          // 思考也在这一刻收掉。不跟 live-reply 的 id 走，换消息时不会闪回来。
           if (latest) {
             setRevealId(latest.id);
             setSettledId(latest.id);
@@ -184,8 +186,16 @@ export function SessionPage() {
         setLiveReply(null);
         return;
       }
+      if (redirected) {
+        navigate("/interview/new");
+        return;
+      }
       if (blocked) {
         const next = await api.chat(content, current?.id, answers, controller.signal, files);
+        if ([...(next.messages || [])].reverse().find((item) => item.role === "assistant")?.extra?.kind === "redirect") {
+          navigate("/interview/new");
+          return;
+        }
         const latest = [...(next.messages || [])].reverse().find((item) => item.role === "assistant");
         if (latest) setRevealId(latest.id);
         setPendingUser(null);
@@ -227,15 +237,6 @@ export function SessionPage() {
     }
   }
 
-  async function startInterview() {
-    try {
-      const iv = await api.startInterview(current?.id);
-      navigate(`/interview/${iv.id}`);
-    } catch (err) {
-      notify(err instanceof Error ? err.message : "无法发起面试", "error");
-    }
-  }
-
   const messages = [...(current?.messages || []), ...(pendingUser ? [pendingUser] : []), ...(liveReply ? [liveReply] : [])];
   const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
   const actions = lastAssistant?.extra?.kind === "clarification" ? [] : lastAssistant?.extra?.actions || [];
@@ -267,9 +268,8 @@ export function SessionPage() {
           onRemoveFile={(name) => setPendingFiles((items) => items.filter((item) => item.name !== name))}
           onStop={() => undefined}
           onChip={(kind) => {
-            if (kind === "jd") onSend(SAMPLE_JD);
-            if (kind === "ask") onSend("请按这个岗位生成针对性题目。");
-            if (kind === "interview") startInterview();
+            if (kind === "ask") onSend("请用一段话说清楚缓存击穿、缓存穿透和缓存雪崩的区别。");
+            if (kind === "interview") navigate("/interview/new");
           }}
         />
       ) : (
@@ -331,7 +331,7 @@ export function SessionPage() {
                     <button
                       key={action}
                       onClick={() => {
-                        if (action.includes("模拟面试")) startInterview();
+                        if (action.includes("模拟面试")) navigate("/interview/new");
                         else onSend(action);
                       }}
                       className="rounded-full border border-field-line bg-well px-3.5 py-2 text-left text-xs text-ink-3 hover:text-ink"
@@ -542,8 +542,8 @@ function ThinkingBlock({
         className="mt-1.5 max-h-[180px] overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
         <div className="flex flex-col gap-2">
-          {thinking ? <ThoughtSection label="Thinking" text={thinking} /> : null}
-          {reasoning ? <ThoughtSection label="Reasoning" text={reasoning} /> : null}
+          {thinking ? <ThoughtSection label="正在想" text={thinking} /> : null}
+          {reasoning ? <ThoughtSection label="推理" text={reasoning} /> : null}
         </div>
       </div>
     </div>
@@ -553,7 +553,7 @@ function ThinkingBlock({
 function ThoughtSection({ label, text }: { label: string; text: string }) {
   return (
     <section>
-      <p className="m-0 text-[11px] font-medium uppercase tracking-[0.04em] text-mute">{label}</p>
+      <p className="m-0 text-[11px] font-medium text-mute">{label}</p>
       <p className="m-0 mt-0.5 whitespace-pre-wrap text-[13px] leading-5 text-dim">{text}</p>
     </section>
   );
@@ -700,7 +700,7 @@ function HomeState({
   files: ChatAttachment[];
   preparing: boolean;
   onSend: () => void;
-  onChip: (kind: "jd" | "ask" | "interview") => void;
+  onChip: (kind: "ask" | "interview") => void;
   onAttach: () => void;
   onRemoveFile: (name: string) => void;
   onStop: () => void;
@@ -714,7 +714,7 @@ function HomeState({
           transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
         >
           <h1 className="text-[32px] font-semibold tracking-tight">你好，小七</h1>
-          <p className="text-[15px] text-mute">发送岗位描述，开始针对性面试训练</p>
+          <p className="text-[15px] text-mute">问一个知识点，或去模拟面试页准备一场面试</p>
         </motion.div>
         <motion.div layoutId="composer" transition={SPRING_LAYOUT} className="w-full">
           <Composer
@@ -735,9 +735,8 @@ function HomeState({
           exit={{ opacity: 0 }}
           transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
         >
-          <Chip icon={<FileText size={13} />} label="粘贴岗位 JD" onClick={() => onChip("jd")} />
-          <Chip icon={<Sparkles size={13} />} label="按岗位出题" onClick={() => onChip("ask")} />
-          <Chip icon={<Mic size={13} />} label="发起模拟面试" onClick={() => onChip("interview")} />
+          <Chip icon={<FileText size={13} />} label="解释一个知识点" onClick={() => onChip("ask")} />
+          <Chip icon={<Mic size={13} />} label="去生成面试" onClick={() => onChip("interview")} />
         </motion.div>
         <motion.p
           className="text-[11px] text-faint"
@@ -841,7 +840,7 @@ function Composer({
         onStop={onStop}
         minRows={home ? 3 : 2}
         maxRows={8}
-        placeholder={home ? "粘贴岗位 JD，或描述你要准备的面试方向…" : "继续提问，或发起模拟面试…"}
+        placeholder={home ? "问一个面试知识点…" : "继续提问…"}
         aria-label={home ? "新会话" : "继续对话"}
         actions={[
           {

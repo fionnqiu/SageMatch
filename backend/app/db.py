@@ -38,6 +38,8 @@ def ensure_schema(eng: Engine) -> None:
         # 语音角色要同时绑 ASR 与 TTS，后加的 TTS 槽位补在已有表上。
         "ALTER TABLE role_bindings ADD COLUMN IF NOT EXISTS tts_provider_id VARCHAR(36)",
         "ALTER TABLE role_bindings ADD COLUMN IF NOT EXISTS tts_model VARCHAR(120) DEFAULT ''",
+        # 开放题和场景题的参考答案是要点，不是单个选项字母。
+        "ALTER TABLE questions ALTER COLUMN answer TYPE VARCHAR(200)",
     ]
     with eng.begin() as conn:
         for sql in patches:

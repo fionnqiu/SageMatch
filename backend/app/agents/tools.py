@@ -41,15 +41,21 @@ async def hybrid_search(db: Session, args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def validate_question(db: Session, args: dict[str, Any]) -> dict[str, Any]:
-    """Deterministic checks only. Semantic quality stays with the critic role."""
+    """Deterministic checks only. Semantic quality stays with the critic role.
+
+    A live interview is spoken. A choice question, or any leftover options, is rejected.
+    """
     del db
     stem = str(args.get("stem") or "").strip()
+    kind = str(args.get("kind") or "open").strip()
     options = args.get("options") or []
     problems: list[str] = []
     if len(stem) < 8:
         problems.append("题干过短")
-    if not isinstance(options, list) or len(options) < 2:
-        problems.append("选项不足")
+    if kind not in {"open", "scenario"}:
+        problems.append("只能是问答题")
+    if isinstance(options, list) and options:
+        problems.append("问答题不能带选项")
     return {"success": not problems, "problems": problems}
 
 

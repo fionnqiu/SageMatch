@@ -93,6 +93,26 @@ def openai_root(base_url: str) -> str:
     return root
 
 
+async def _ping_chat(api_key: str, base_url: str, model: str) -> None:
+    """One short non-streaming completion. Thinking stays off so the probe can finish."""
+    if not api_key:
+        raise RuntimeError("LLM_API_KEY is empty")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 8,
+        "stream": False,
+        "enable_thinking": False,
+        "messages": [{"role": "user", "content": "回复 ok"}],
+    }
+    # 管理端按钮不应等满正式对话的 60 秒读超时。连不上就在 25 秒内失败。
+    timeout = httpx.Timeout(25.0, connect=8.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        res = await client.post(f"{openai_root(base_url)}/chat/completions", headers=headers, json=body)
+        res.raise_for_status()
+
+
 async def list_models(protocol: str, api_key: str, base_url: str) -> list[str]:
     """Probe the OpenAI-compatible /models list."""
     if not api_key:
@@ -155,17 +175,9 @@ async def ping_provider(
         elif protocol in {"openai_embeddings", "openai_embed"}:
             await embed_texts(["ping"], api_key=api_key, base_url=base_url, model=model or "text-embedding-3-small")
         elif protocol == CHAT_PROTOCOL or protocol.startswith("openai") or protocol.startswith("anthropic"):
-            # 连通性也走写死的思考加流式，避免探测请求和正式调用不是同一条协议。
-            await complete_text(
-                "ping",
-                "回复 ok",
-                max_tokens=8,
-                api_key=api_key,
-                base_url=base_url,
-                model=model or "gpt-4o-mini",
-                temperature=0,
-                top_p=1.0,
-            )
+            # 探测只确认密钥、地址和模型能回一个字。正式对话的思考和流式不放进这次短请求，
+            # 否则思考模型在 60 秒读超时里还没吐出首块，按钮就会一直失败。
+            await _ping_chat(api_key, base_url, model or "gpt-4o-mini")
         else:
             return False, 0, "WebSocket 音频协议本期不测连通性"
         ms = int((time.perf_counter() - started) * 1000)
@@ -273,6 +285,7 @@ async def _iter_chat_parts(res: httpx.Response) -> AsyncIterator[tuple[str, str]
             or delta.get("reasoning_text")
             or choice.get("reasoning_content")
             or choice.get("reasoning")
+            or _reasoning_details_text(delta.get("reasoning_details") or choice.get("reasoning_details"))
         )
         content = delta.get("content")
         if thinking:
@@ -281,6 +294,23 @@ async def _iter_chat_parts(res: httpx.Response) -> AsyncIterator[tuple[str, str]
             yield "reasoning", str(reasoning)
         if content:
             yield "content", str(content)
+
+
+def _reasoning_details_text(raw: Any) -> str:
+    """兼容接口会把思考放进列表，而不是 reasoning_content 字符串。"""
+    if isinstance(raw, str):
+        return raw
+    if not isinstance(raw, list):
+        return ""
+    parts: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            parts.append(item)
+        elif isinstance(item, dict):
+            text = item.get("text") or item.get("content") or item.get("reasoning") or ""
+            if str(text).strip():
+                parts.append(str(text))
+    return "".join(parts)
 
 
 def _extract_json(raw: str) -> dict[str, Any]:

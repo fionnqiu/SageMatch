@@ -154,6 +154,23 @@ class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
             llm.httpx.AsyncClient = original  # type: ignore[assignment]
         self.assertEqual(parts, [("thinking", "先看岗位"), ("reasoning", "岗位要求分布式")])
 
+    async def test_stream_parts_accept_reasoning_details(self) -> None:
+        """有的兼容接口把思考放在 reasoning_details，不放 reasoning_content。"""
+        response = _StreamResponse(
+            [
+                'data: {"choices":[{"delta":{"reasoning_details":[{"text":"先对照岗位职责"}]}}]}',
+                "data: [DONE]",
+            ]
+        )
+        client = _Client(response)
+        original = llm.httpx.AsyncClient
+        llm.httpx.AsyncClient = lambda **_kwargs: client  # type: ignore[assignment]
+        try:
+            parts = [item async for item in llm.stream_chat_parts("系统", "用户", api_key="key", base_url="https://example.test/v1", model="qwen")]
+        finally:
+            llm.httpx.AsyncClient = original  # type: ignore[assignment]
+        self.assertEqual(parts, [("reasoning", "先对照岗位职责")])
+
     def test_sse_frame_keeps_chinese_text(self) -> None:
         frame = _sse({"type": "delta", "text": "回答"})
         self.assertTrue(frame.startswith("data: "))

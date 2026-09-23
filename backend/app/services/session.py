@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from typing import Any
+
+# 用户已经点名要一场面试。回答模型无权再解释成「不能出题」。
+_INTERVIEW_REQUEST = re.compile(r"(模拟面试|面试题|出题|生成.{0,8}面试|开始.{0,8}面试)")
 
 from sqlalchemy import exists, or_
 from sqlalchemy.orm import Session, selectinload
@@ -203,6 +207,19 @@ async def begin_chat(
             session = reloaded
 
     existing = latest_question_set_for_session(db, session.id)
+    # 出题已经挪到面试页。会话里点名要面试时不再跑感知，也不再生成题目。
+    if _asks_for_interview(content):
+        intent = {"intent": "answer", "needs_recall": False, "todos": [], "actions": ["redirect"], "source": "redirect"}
+        return {
+            "session": session,
+            "content": content,
+            "intent": intent,
+            "first_turn": first_turn,
+            "opening": opening,
+            "mode": "redirect",
+            "prompt": None,
+            "extra": None,
+        }
     # 选项只是把方向补进这句话。无论有没有选项，这一轮都由感知代理决定。
     intent = await resolve_intent(
         db,
@@ -217,10 +234,13 @@ async def begin_chat(
     extra: dict[str, Any] | None = None
     if intent["intent"] == "clarify" and not answers:
         mode = "clarify"
-    elif existing and existing.questions and intent["intent"] != "generate_interview":
+    elif intent["intent"] == "generate_interview":
+        # 感知仍可能把岗位描述认成出题。会话只负责把人带到面试页。
+        mode = "redirect"
+    elif existing and existing.questions:
         mode = "followup"
         prompt, extra = await prepare_followup(db, session, existing, content)
-    elif intent["intent"] != "generate_interview":
+    else:
         mode = "answer"
         prompt, extra = await prepare_direct_answer(db, session, content, intent)
     return {
@@ -250,7 +270,6 @@ async def chat_stream_mode(
         model_content = _apply_clarification(pending, answers)
     elif attachments:
         _visible, model_content, _files = _compose_turn(content, attachments)
-    existing = latest_question_set_for_session(db, session.id) if session is not None else None
     intent = await resolve_intent(
         db,
         model_content,
@@ -259,13 +278,14 @@ async def chat_stream_mode(
     )
     if intent["intent"] == "clarify" and not answers:
         return "blocked"
-    if intent["intent"] == "generate_interview" and not (existing and existing.questions):
-        return "blocked"
+    if intent["intent"] == "generate_interview" or _asks_for_interview(model_content):
+        # 出题不在这条流里。前端收到 redirect 后打开面试页。
+        return "redirect"
     return "stream"
 
 
 def iter_turn_parts(db: Session, turn: dict[str, Any]) -> AsyncIterator[tuple[str, str]]:
-    """只对知识回答和追问逐块产出。思考和正文分开，澄清和出题没有增量。"""
+    """只对知识回答和追问逐块产出。出题不再从会话流里生成。"""
     prompt = turn.get("prompt")
     if turn.get("mode") not in {"answer", "followup"} or not isinstance(prompt, dict):
         raise RuntimeError("这一轮不能逐块输出")
@@ -288,6 +308,8 @@ async def complete_chat_turn(db: Session, turn: dict[str, Any]) -> tuple[str, di
         except Exception:
             reply = prompt["fallback"]
         return reply, {**turn["extra"], "intent": intent["intent"]}
+    if mode == "redirect":
+        return _redirect_reply(), {"kind": "redirect", "intent": "generate_interview"}
     reply, extra = await generate_and_store(db, session, content)
     return reply, {**extra, "intent": intent["intent"]}
 
@@ -338,9 +360,11 @@ def _compose_turn(content: str, attachments: list[dict[str, Any]]) -> tuple[str,
     return visible, model_content, files
 
 
-async def generate_and_store(db: Session, session: ChatSession, content: str) -> tuple[str, dict[str, Any]]:
+async def generate_and_store(
+    db: Session, session: ChatSession, content: str, on_thought=None
+) -> tuple[str, dict[str, Any]]:
     hits = await recall_snippets(db, content)
-    payload = await generate_question_pack(db, content, hits, session.id)
+    payload = await generate_question_pack(db, content, hits, session.id, on_thought=on_thought)
     job_title = payload.get("job_title") or title_from(content)
     session.job_title = job_title
     # 历史标题已经按首轮对话定过。岗位名留在 job_title，不再把侧边栏改成「岗位（N题）」。
@@ -376,25 +400,24 @@ async def generate_and_store(db: Session, session: ChatSession, content: str) ->
                 question_set_id=qset.id,
                 ordinal=i,
                 stem=item.get("stem") or f"题目 {i}",
-                options=item.get("options") or [],
-                answer=item.get("answer") or "A",
+                options=_stored_options(item),
+                answer=str(item.get("answer") or "")[:200] or "见解析",
                 explanation=item.get("explanation") or "",
                 generated_by="system",
             )
         )
 
     # Ready card on the interview hub, without starting the live stage.
-    db.add(
-        Interview(
-            id=new_id(),
-            profile_id=profile.id,
-            question_set_id=qset.id,
-            title=f"{job_title} · 全真模拟面试",
-            status="ready",
-            tags=payload.get("focus") or [],
-            summary=payload.get("summary") or "基于岗位要求生成 · 预计时长 30 分钟",
-        )
+    interview = Interview(
+        id=new_id(),
+        profile_id=profile.id,
+        question_set_id=qset.id,
+        title=f"{job_title} · 全真模拟面试",
+        status="ready",
+        tags=payload.get("focus") or [],
+        summary=payload.get("summary") or "基于岗位要求生成 · 预计时长 30 分钟",
     )
+    db.add(interview)
 
     extra = {
         "kind": "question_pack",
@@ -406,6 +429,8 @@ async def generate_and_store(db: Session, session: ChatSession, content: str) ->
         "actions": payload.get("actions") or ["直接发起一场 30 分钟全真模拟面试实战"],
     }
     reply = payload.get("reply") or "已分析该岗位的核心要求，正在为你生成针对性题目。"
+    # 面试页要拿到这场面试的 id。会话旧路径仍只用 reply 和 extra。
+    extra["interview_id"] = interview.id
     return reply, extra
 
 
@@ -433,7 +458,7 @@ async def prepare_direct_answer(
         knowledge_block = "（这一轮不需要检索知识库）"
     history = _history_lines(session, 6)
     prompt = {
-        "system": "你是面试知识助手。用户这一轮只是提问，直接回答。不要生成面试题，也不要建议开始模拟面试。",
+        "system": "你是面试知识助手。用户这一轮只是提问，直接回答。不要生成面试题。若用户要出题或开始面试，告诉对方去模拟面试页。",
         "user": f"知识片段：\n{knowledge_block}\n\n最近对话：\n{history}\n\n用户：{content}",
         "fallback": "这一轮先按知识问题回答；模型暂时不可用。你可以稍后再问，或明确说出要准备的岗位。",
     }
@@ -485,6 +510,11 @@ async def _iter_parts_or_fallback(db: Session, prompt: dict[str, str]) -> AsyncI
             yield kind, delta
     except Exception:
         yield "content", prompt["fallback"]
+
+
+def _redirect_reply() -> str:
+    """会话不再出题。这句话只负责把人送到面试页，避免回答模型再说自己不能出题。"""
+    return "出题已改到模拟面试页。把岗位描述发到那里，生成完成后可以直接开始面试。"
 
 
 def _recent_dialogue(session: ChatSession) -> str:
@@ -625,13 +655,17 @@ def title_from(text: str) -> str:
 
 
 async def generate_question_pack(
-    db: Session, job_text: str, hits: list[dict[str, Any]], session_id: str | None = None
+    db: Session,
+    job_text: str,
+    hits: list[dict[str, Any]],
+    session_id: str | None = None,
+    on_thought=None,
 ) -> dict[str, Any]:
     """Author a question pack through the author contract. Eval reuses this same path."""
     if not llm.llm_available():
         return stub_pack(job_text)
     try:
-        data = await author_questions(db, job_text, session_id=session_id, hits=hits)
+        data = await author_questions(db, job_text, session_id=session_id, hits=hits, on_thought=on_thought)
         if not data.get("questions"):
             return stub_pack(job_text)
         data.pop("_agent", None)
@@ -640,63 +674,76 @@ async def generate_question_pack(
         return stub_pack(job_text)
 
 
+def _asks_for_interview(content: str) -> bool:
+    """A named interview request is enough. A bare job title without this ask still goes to the model."""
+    return bool(_INTERVIEW_REQUEST.search(content or ""))
+
+
+def _stored_options(item: dict[str, Any]) -> list:
+    """Live interviews are spoken. Options are dropped even if a model still returns them."""
+    del item
+    return []
+
+
 def stub_pack(job_text: str) -> dict[str, Any]:
     title = "资深分布式系统架构师" if "架构" in job_text else title_from(job_text)
+    # Offline packs follow the same band as the author: eight spoken-heavy questions, not five choices.
     questions = [
         {
-            "stem": "为什么微服务优先用本地缓存加 Redis 两级缓存？",
-            "options": [
-                {"key": "A", "text": "降低跨网络调用的平均延迟，减少对 Redis 的集中式压力"},
-                {"key": "B", "text": "因为本地缓存的一致性天然强于 Redis 集群"},
-                {"key": "C", "text": "因为 Redis 不支持持久化，必须靠本地缓存兜底"},
-                {"key": "D", "text": "为了减少 Redis 的内存占用与集群分片数量"},
-            ],
-            "answer": "A",
-            "explanation": "本地热点缓存挡住重复读，Redis 承接跨实例共享；一致性要靠失效与锁，而不是本地更强。",
+            "kind": "open",
+            "stem": "这个岗位要你设计一套可扩展的 AI 应用架构。你会如何拆分模型调用、检索和工具调用？",
+            "options": [],
+            "answer": "按调用、检索、工具三层拆分，并说明扩展点和失败边界",
+            "explanation": "听候选人是否能把 LLM、RAG 和工具调用拆开，而不是堆在一个接口里。",
         },
         {
-            "stem": "缓存击穿时为什么常用互斥锁而不是直接打到数据库？",
-            "options": [
-                {"key": "A", "text": "只让一个线程回源，避免瞬时流量打穿存储"},
-                {"key": "B", "text": "互斥锁能保证缓存与数据库强一致"},
-                {"key": "C", "text": "锁可以替代过期时间"},
-                {"key": "D", "text": "这样就不需要再做限流"},
-            ],
-            "answer": "A",
-            "explanation": "击穿的核心是热点失效后的并发回源，互斥是限流而不是一致性方案。",
+            "kind": "scenario",
+            "stem": "检索结果经常答非所问。你会怎么定位是切块、召回还是提示词的问题？",
+            "options": [],
+            "answer": "先看召回片段是否相关，再看提示是否约束了引用",
+            "explanation": "排查要有顺序：先验证检索命中，再谈生成。",
         },
         {
-            "stem": "Redisson 看门狗的主要作用是什么？",
-            "options": [
-                {"key": "A", "text": "在业务未完成时自动续期，避免锁被提前释放"},
-                {"key": "B", "text": "把 Redis 变成强一致数据库"},
-                {"key": "C", "text": "替代熔断器做服务降级"},
-                {"key": "D", "text": "自动选择主从节点"},
-            ],
-            "answer": "A",
-            "explanation": "看门狗按 leaseTime 心跳续期，防止 GC 或慢查询导致锁过期后被别人抢走。",
+            "kind": "open",
+            "stem": "如果要接入 MCP 或 Function Call，你如何决定一个工具该不该交给模型？",
+            "options": [],
+            "answer": "只把边界清楚、可校验、失败可回退的动作做成工具",
+            "explanation": "工具不是越多越好，关键是权限和失败后的退路。",
         },
         {
-            "stem": "微服务熔断后客户端应如何验证降级默认值？",
-            "options": [
-                {"key": "A", "text": "结合半开探活与幂等，避免重试把错误流量放大"},
-                {"key": "B", "text": "直接把默认值返回前端即可"},
-                {"key": "C", "text": "降级后禁止任何重试"},
-                {"key": "D", "text": "把超时时间调到最大"},
-            ],
-            "answer": "A",
-            "explanation": "降级默认值必须可验证；无节制重试会在熔断期间放大错误。",
+            "kind": "scenario",
+            "stem": "线上回答突然变慢，用户开始超时。你会先看哪一层，并如何临时止血？",
+            "options": [],
+            "answer": "先分清模型延迟、检索延迟和下游工具，再限流或降级",
+            "explanation": "并发瓶颈要先定位，再决定降级，而不是一律加大超时。",
         },
         {
-            "stem": "瞬时洪峰下网关层常见的防击穿手段是什么？",
-            "options": [
-                {"key": "A", "text": "布隆过滤非法请求，并对热点 key 做互斥回源"},
-                {"key": "B", "text": "关掉本地缓存，全部走 Redis"},
-                {"key": "C", "text": "把数据库连接池扩到最大"},
-                {"key": "D", "text": "取消过期时间让 key 永不过期且不再刷新"},
-            ],
-            "answer": "A",
-            "explanation": "网关拦截无效流量，热点保护避免缓存失效瞬间打穿存储。",
+            "kind": "open",
+            "stem": "长对话里模型开始忘记前面的约束。你会怎么区分该进上下文的内容和该外置的记忆？",
+            "options": [],
+            "answer": "近期原话留在上下文，稳定事实外置，并说明何时回读",
+            "explanation": "看候选人是否把工作记忆和长期记忆分开，而不是无限加长提示。",
+        },
+        {
+            "kind": "scenario",
+            "stem": "同一个岗位描述连续两次出题，题目高度重复。你怎么在生成链路里发现并停下来？",
+            "options": [],
+            "answer": "用题干重叠率做闸门，超阈值则带原因重出一次后停止",
+            "explanation": "质检要有停止条件，不能为了换题无限循环。",
+        },
+        {
+            "kind": "open",
+            "stem": "让你和后端、产品一起落地一个 Agent 功能。你如何划清谁决定工具权限、谁验收结果？",
+            "options": [],
+            "answer": "权限由契约约束，验收看可观察结果，不由模型自行放宽",
+            "explanation": "协作题看边界，而不是只讲个人能写什么代码。",
+        },
+        {
+            "kind": "open",
+            "stem": "为什么热点读会用本地缓存加 Redis，而不是只靠其中一层？一致性你怎么处理？",
+            "options": [],
+            "answer": "本地挡重复读，Redis 做跨实例共享；一致性靠失效和锁，不是本地更强",
+            "explanation": "问答题听候选人讲分层和一致性，不再用选项暗示答案。",
         },
     ]
     return {

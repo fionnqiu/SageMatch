@@ -39,7 +39,8 @@ class Question(Base):
     ordinal: Mapped[int] = mapped_column(Integer, default=0)
     stem: Mapped[str] = mapped_column(Text)
     options: Mapped[list] = mapped_column(JSONB, default=lambda: [])
-    answer: Mapped[str] = mapped_column(String(8), default="A")
+    # Open and scenario answers are a rubric, not a single option letter.
+    answer: Mapped[str] = mapped_column(String(200), default="")
     explanation: Mapped[str] = mapped_column(Text, default="")
     generated_by: Mapped[str] = mapped_column(String(40), default="system")
 

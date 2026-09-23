@@ -10,7 +10,23 @@ export function InterviewReportPage() {
 
   useEffect(() => {
     if (!id) return;
-    api.interview(id).then(setInterview);
+    const interviewId = id;
+    let cancelled = false;
+    let timer = 0;
+
+    async function load() {
+      const data = await api.interview(interviewId);
+      if (cancelled) return;
+      setInterview(data);
+      // 复盘在后台写。报告还没落库时隔几秒再问一次，不占着结束请求。
+      if (!data.report) timer = window.setTimeout(load, 2500);
+    }
+
+    load().catch(() => undefined);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [id]);
 
   const report = interview?.report;
@@ -61,7 +77,9 @@ export function InterviewReportPage() {
 
         <div className="rounded-[14px] border border-line bg-card p-[22px]">
           <div className="mb-3 text-sm font-semibold">面试综合表现点评</div>
-          <p className="text-[13px] leading-6 text-ink-3">{report?.review}</p>
+          <p className="text-[13px] leading-6 text-ink-3">
+            {report?.review || (interview && !report ? "复盘还在后台生成，页面可以先离开。" : "")}
+          </p>
         </div>
 
         <div className="space-y-4 rounded-[14px] border border-line bg-card p-[22px]">

@@ -13,12 +13,14 @@ function formatWhen(iso: string) {
 }
 
 function detailText(detail: AuditLog["detail"]) {
-  if (!detail || !Object.keys(detail).length) return "—";
-  try {
-    return JSON.stringify(detail);
-  } catch {
-    return "—";
-  }
+  if (detail == null) return "—";
+  if (typeof detail === "string") return detail || "—";
+  if (typeof detail !== "object") return String(detail);
+  const entries = Object.entries(detail as Record<string, unknown>);
+  if (!entries.length) return "—";
+  return entries
+    .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`)
+    .join("，");
 }
 
 /** 调用日志和操作留痕共用同一套前端分页，避免两张表各写一套页码状态。 */

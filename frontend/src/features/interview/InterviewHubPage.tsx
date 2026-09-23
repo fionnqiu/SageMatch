@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Play, Sparkles, Trash2 } from "lucide-react";
+import { Play, Plus, Sparkles, Trash2 } from "lucide-react";
 import { api, type Interview } from "../../api";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { notify } from "../../lib/notify";
@@ -75,6 +75,13 @@ export function InterviewHubPage() {
           </div>
           <div className="text-sm font-semibold">模拟面试</div>
         </div>
+        <button
+          onClick={() => navigate("/interview/new")}
+          className="flex items-center gap-1.5 rounded-lg bg-forest px-3.5 py-2 text-xs font-semibold text-mint-4"
+        >
+          <Plus size={14} className="text-mint-2" />
+          创建面试
+        </button>
       </header>
 
       <div className="min-h-0 flex-1 space-y-[22px] overflow-y-auto px-8 py-7">
@@ -122,7 +129,7 @@ export function InterviewHubPage() {
 
         {loaded && !live && rest.length === 0 ? (
           <div className="rounded-[14px] border border-line bg-card p-8 text-sm text-dim">
-            还没有面试场次。先在会话里提交岗位描述生成题目，再回到这里发起模拟面试。
+            还没有面试场次。点右上角「创建面试」，写下岗位后再开始。
           </div>
         ) : null}
 
@@ -133,11 +140,11 @@ export function InterviewHubPage() {
             return (
               <div
                 key={item.id}
-                className={`flex flex-col justify-between rounded-[14px] border p-4 ${
+                className={`flex h-[248px] flex-col justify-between overflow-hidden rounded-[14px] border p-4 ${
                   ready ? "border-forest-2/40 bg-card-live" : "border-line bg-card"
                 }`}
               >
-                <div className="space-y-2">
+                <div className="min-h-0 flex-1 space-y-2 overflow-hidden">
                   <div className="flex items-center justify-between">
                     <span
                       className={`rounded-full px-2.5 py-0.5 text-[10px] font-semibold ${
@@ -157,18 +164,18 @@ export function InterviewHubPage() {
                       </button>
                     </span>
                   </div>
-                  <div className="text-[15px] font-semibold">{item.title}</div>
+                  <div className="line-clamp-2 text-[15px] font-semibold">{item.title}</div>
                   <div className="text-[11px] text-dim">
                     {ended ? `${formatWhen(item.ended_at)} 完成` : "基于岗位要求生成 · 预计时长 30 分钟"}
                   </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {(item.tags || []).map((tag) => (
-                      <span key={tag} className="rounded-full bg-chip px-2 py-0.5 text-[10px] text-mute">
+                  <div className="flex h-5 gap-1.5 overflow-hidden">
+                    {(item.tags || []).slice(0, 3).map((tag) => (
+                      <span key={tag} className="shrink-0 rounded-full bg-chip px-2 py-0.5 text-[10px] text-mute">
                         {tag}
                       </span>
                     ))}
                   </div>
-                  <p className="text-xs leading-5 text-mute">{item.summary}</p>
+                  <p className="line-clamp-2 text-xs leading-5 text-mute">{item.summary}</p>
                 </div>
                 <button
                   onClick={() => openCard(item)}
