@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 from sqlalchemy import exists, or_
@@ -22,7 +23,10 @@ from app.agents.authoring import author_questions
 from app.agents.memory import MemoryManager
 from app.services.common import ANON, audit, new_id, now
 from app.services.intent import resolve_intent
-from app.services.llm_gateway import complete
+from app.services.llm_gateway import complete, stream_parts
+
+# 知识回答和追问要能写完整段分析。700 会在简历分析这类长回答中途被供应商截断。
+ANSWER_MAX_TOKENS = 4096
 from app.services.recall import recall_snippets
 
 
@@ -130,22 +134,41 @@ async def send_chat(
     content: str,
     session_id: str | None,
     answers: list[dict[str, Any]] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> ChatSession:
     """Generate a pack on first JD; later turns are knowledge follow-ups, not a new pack.
 
     answers 只在上一轮留下澄清题时使用：把它并回岗位描述再出题，避免模型凭空猜方向。
     """
+    turn = await begin_chat(db, content, session_id, answers, attachments)
+    reply, extra = await complete_chat_turn(db, turn)
+    return await finish_chat(db, turn, reply, extra)
+
+
+async def begin_chat(
+    db: Session,
+    content: str,
+    session_id: str | None,
+    answers: list[dict[str, Any]] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """写入用户消息并决定这一轮怎么回答。流式接口只接能逐块生成的知识回答和追问。"""
     session = get_session(db, session_id) if session_id else None
+    created = False
     if session is None:
         session = ChatSession(id=new_id(), title="新会话", user_id=ANON)
         db.add(session)
         db.flush()
+        created = True
 
     pending = _pending_clarification(session)
     # 标题只看第一条用户消息。澄清选项和后续追问不再改历史里的名字。
-    opening = content if not any(message.role == "user" for message in (session.messages or [])) else ""
+    first_turn = not any(message.role == "user" for message in (session.messages or []))
+    opening = ""
     if pending and answers:
         content = _apply_clarification(pending, answers)
+        if first_turn:
+            opening = content
         db.add(
             ChatMessage(
                 id=new_id(),
@@ -156,8 +179,28 @@ async def send_chat(
             )
         )
     else:
-        db.add(ChatMessage(id=new_id(), session_id=session.id, role="user", content=content))
-    db.flush()
+        # 气泡只留用户自己写的字和文件名。抽出的正文放进模型上下文，不回写到 content。
+        visible, model_content, files = _compose_turn(content, attachments or [])
+        content = model_content
+        if first_turn:
+            opening = visible or "、".join(item["name"] for item in files)
+        db.add(
+            ChatMessage(
+                id=new_id(),
+                session_id=session.id,
+                role="user",
+                content=visible,
+                extra={"kind": "attachment", "files": files} if files else None,
+            )
+        )
+    # 用户这句话先落库。后面的模型流可以中断，刷新后仍能看到自己发过什么。
+    session_id_saved = session.id
+    db.commit()
+    # 新建会话还没进查询结果时，继续用刚写入的对象。已有会话提交后重新加载消息。
+    if not created:
+        reloaded = get_session(db, session_id_saved)
+        if reloaded is not None:
+            session = reloaded
 
     existing = latest_question_set_for_session(db, session.id)
     # 选项只是把方向补进这句话。无论有没有选项，这一轮都由感知代理决定。
@@ -169,19 +212,92 @@ async def send_chat(
     )
     if answers:
         intent = {**intent, "source": "clarification"}
+    mode = "blocked"
+    prompt: dict[str, str] | None = None
+    extra: dict[str, Any] | None = None
     if intent["intent"] == "clarify" and not answers:
-        # 只有模型判断这一句确实不够出题时才追问，问题和选项都用它这一轮写的。
-        reply, extra = _clarification_from_intent(content, intent)
+        mode = "clarify"
     elif existing and existing.questions and intent["intent"] != "generate_interview":
-        reply, extra = await chat_followup(db, session, existing, content)
+        mode = "followup"
+        prompt, extra = await prepare_followup(db, session, existing, content)
     elif intent["intent"] != "generate_interview":
-        reply, extra = await answer_directly(db, session, content, intent)
-    else:
-        reply, extra = await generate_and_store(db, session, content)
-    extra = {**extra, "intent": intent["intent"]}
+        mode = "answer"
+        prompt, extra = await prepare_direct_answer(db, session, content, intent)
+    return {
+        "session": session,
+        "content": content,
+        "intent": intent,
+        "first_turn": first_turn,
+        "opening": opening,
+        "mode": mode,
+        "prompt": prompt,
+        "extra": extra,
+    }
 
-    if opening:
-        session.title = await session_title(db, opening)
+
+async def chat_stream_mode(
+    db: Session,
+    content: str,
+    session_id: str | None,
+    answers: list[dict[str, Any]] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> str:
+    """判断这一轮能不能逐块输出。不写消息，避免不能流时把同一句话落两次。"""
+    session = get_session(db, session_id) if session_id else None
+    pending = _pending_clarification(session)
+    model_content = content
+    if pending and answers:
+        model_content = _apply_clarification(pending, answers)
+    elif attachments:
+        _visible, model_content, _files = _compose_turn(content, attachments)
+    existing = latest_question_set_for_session(db, session.id) if session is not None else None
+    intent = await resolve_intent(
+        db,
+        model_content,
+        recall=lambda query: recall_snippets(db, query),
+        history=lambda: MemoryManager(db, session_id=session.id).render() if session is not None else "",
+    )
+    if intent["intent"] == "clarify" and not answers:
+        return "blocked"
+    if intent["intent"] == "generate_interview" and not (existing and existing.questions):
+        return "blocked"
+    return "stream"
+
+
+def iter_turn_parts(db: Session, turn: dict[str, Any]) -> AsyncIterator[tuple[str, str]]:
+    """只对知识回答和追问逐块产出。思考和正文分开，澄清和出题没有增量。"""
+    prompt = turn.get("prompt")
+    if turn.get("mode") not in {"answer", "followup"} or not isinstance(prompt, dict):
+        raise RuntimeError("这一轮不能逐块输出")
+    return _iter_parts_or_fallback(db, prompt)
+
+
+async def complete_chat_turn(db: Session, turn: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """整段接口的后半段。能流的模式也从这里收齐，保证和 SSE 用同一份提示。"""
+    session = turn["session"]
+    content = turn["content"]
+    intent = turn["intent"]
+    mode = turn["mode"]
+    if mode == "clarify":
+        # 只有模型判断这一句确实不够出题时才追问，问题和选项都用它这一轮写的。
+        return _clarification_from_intent(content, intent)
+    if mode in {"answer", "followup"} and turn["prompt"] is not None:
+        prompt = turn["prompt"]
+        try:
+            reply = await complete(db, "analyst", prompt["system"], prompt["user"], max_tokens=ANSWER_MAX_TOKENS)
+        except Exception:
+            reply = prompt["fallback"]
+        return reply, {**turn["extra"], "intent": intent["intent"]}
+    reply, extra = await generate_and_store(db, session, content)
+    return reply, {**extra, "intent": intent["intent"]}
+
+
+async def finish_chat(db: Session, turn: dict[str, Any], reply: str, extra: dict[str, Any]) -> ChatSession:
+    """助手消息和标题都在正文收齐后写入。流式中途不落半句。"""
+    session = turn["session"]
+    if turn["first_turn"] and turn["opening"]:
+        # 标题仍是一次短调用。正文流结束后再起名，避免和回答抢同一轮输出。
+        session.title = await session_title(db, turn["opening"])
     session.updated_at = now()
     db.add(
         ChatMessage(
@@ -196,13 +312,30 @@ async def send_chat(
     return get_session(db, session.id)  # type: ignore[return-value]
 
 
-async def ingest_chat_file(db: Session, session_id: str | None, filename: str, data: bytes) -> ChatSession:
+def prepare_chat_file(filename: str, data: bytes) -> str:
+    """抽出附件正文，留给输入框。发送时才和用户写的字一起进会话。"""
     text = knowledge.parse_bytes(filename, data)
-    if not text.strip():
-        raise ValueError("无法从该文件提取文本，请改用 TXT / MD / PDF")
-    prefix = f"【上传文件 {filename}】\n"
-    body = text[:12000]
-    return await send_chat(db, prefix + body, session_id)
+    cleaned = text.strip()
+    if not cleaned:
+        raise ValueError("无法从该文件提取文本，请改用 TXT、MD、PDF 或 DOCX")
+    return cleaned[:12000]
+
+
+def _compose_turn(content: str, attachments: list[dict[str, Any]]) -> tuple[str, str, list[dict[str, Any]]]:
+    """可见内容不含文件正文。模型侧把正文接在用户这句话后面。"""
+    files: list[dict[str, Any]] = []
+    bodies: list[str] = []
+    for item in attachments:
+        name = str(item.get("name") or "附件").strip() or "附件"
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        files.append({"name": name[:180], "size": int(item.get("size") or 0)})
+        bodies.append(f"【附件 {name}】\n{text[:12000]}")
+    visible = content.strip()
+    # 只有附件时，模型仍要看到正文，不能拿到空字符串。
+    model_content = "\n\n".join(part for part in [visible, *bodies] if part) or "请阅读附件。"
+    return visible, model_content, files
 
 
 async def generate_and_store(db: Session, session: ChatSession, content: str) -> tuple[str, dict[str, Any]]:
@@ -267,7 +400,6 @@ async def generate_and_store(db: Session, session: ChatSession, content: str) ->
         "kind": "question_pack",
         "question_set_id": qset.id,
         "profile_id": profile.id,
-        "thinking": _thinking_for_pack(job_title, payload.get("focus") or [], hits),
         # 出题清单跟这一份岗位和实际检索结果走，不再套「阅读 / 检索 / 出题 / 核对」四步。
         "todos": _todos_for_pack(job_title, payload.get("focus") or [], hits, bool(questions)),
         "questions": [{"stem": q.get("stem"), "ordinal": i} for i, q in enumerate(questions, start=1)],
@@ -281,61 +413,95 @@ async def answer_directly(
     db: Session, session: ChatSession, content: str, intent: dict[str, Any]
 ) -> tuple[str, dict[str, Any]]:
     """Answer without creating questions. Retrieval and checklist come from perception."""
+    prompt, extra = await prepare_direct_answer(db, session, content, intent)
+    try:
+        reply = await complete(db, "analyst", prompt["system"], prompt["user"], max_tokens=ANSWER_MAX_TOKENS)
+    except Exception:
+        reply = prompt["fallback"]
+    return reply, extra
+
+
+async def prepare_direct_answer(
+    db: Session, session: ChatSession, content: str, intent: dict[str, Any]
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """检索和提示先完成。流式接口拿到提示后再逐块调用模型。"""
     needs_recall = bool(intent.get("needs_recall"))
     hits = await recall_snippets(db, content) if needs_recall else []
-    sources = [str(hit.get("filename") or "") for hit in hits[:3] if hit.get("filename")]
     if needs_recall:
         knowledge_block = "\n\n".join(h["text"][:400] for h in hits) if hits else "（知识库暂无命中）"
     else:
         knowledge_block = "（这一轮不需要检索知识库）"
-    history = "\n".join(f"{m.role}: {m.content[:400]}" for m in (session.messages or [])[-6:])
-    system = "你是面试知识助手。用户这一轮只是提问，直接回答。不要生成面试题，也不要建议开始模拟面试。"
-    user = f"知识片段：\n{knowledge_block}\n\n最近对话：\n{history}\n\n用户：{content}"
-    try:
-        reply = await complete(db, "analyst", system, user, max_tokens=700)
-    except Exception:
-        reply = "这一轮先按知识问题回答；模型暂时不可用。你可以稍后再问，或明确说出要准备的岗位。"
-    if not needs_recall:
-        thinking = "这是普通对话，不出题，也不需要查知识库。"
-    elif sources:
-        thinking = f"这是知识提问，不出题。检索到{'、'.join(sources)}，再按这些片段回答。"
-    else:
-        thinking = "这是知识提问，不出题。知识库没有命中，只按问题本身回答。"
-    return reply, {
+    history = _history_lines(session, 6)
+    prompt = {
+        "system": "你是面试知识助手。用户这一轮只是提问，直接回答。不要生成面试题，也不要建议开始模拟面试。",
+        "user": f"知识片段：\n{knowledge_block}\n\n最近对话：\n{history}\n\n用户：{content}",
+        "fallback": "这一轮先按知识问题回答；模型暂时不可用。你可以稍后再问，或明确说出要准备的岗位。",
+    }
+    extra = {
         "kind": "answer",
         "intent": "answer",
-        "thinking": thinking,
         # 知识问答优先用感知代理为这一句写的步骤。没写才按检索结果补一条。
         "todos": intent.get("todos") or _todos_for_answer(content, needs_recall, hits),
     }
+    return prompt, extra
 
 
 async def chat_followup(
     db: Session, session: ChatSession, qset: QuestionSet, content: str
 ) -> tuple[str, dict[str, Any]]:
+    prompt, extra = await prepare_followup(db, session, qset, content)
+    try:
+        reply = await complete(db, "analyst", prompt["system"], prompt["user"], max_tokens=ANSWER_MAX_TOKENS)
+    except Exception:
+        reply = prompt["fallback"]
+    return reply, extra
+
+
+async def prepare_followup(
+    db: Session, session: ChatSession, qset: QuestionSet, content: str
+) -> tuple[dict[str, str], dict[str, Any]]:
     questions = list(qset.questions)
     stems = "\n".join(f"{q.ordinal}. {q.stem}" for q in questions)
     hits = await recall_snippets(db, content)
     knowledge_block = "\n\n".join(h["text"][:400] for h in hits) if hits else "（知识库暂无命中）"
-    history = "\n".join(f"{m.role}: {m.content[:400]}" for m in (session.messages or [])[-8:])
-    system = "你是模拟面试训练助手。回答用户对题目或岗位知识的追问。不要重新出一整套题。不要使用「对弈」「博弈」「棋」等字眼。"
-    user = f"已有题目：\n{stems}\n\n知识片段：\n{knowledge_block}\n\n最近对话：\n{history}\n\n用户：{content}"
-    try:
-        reply = await complete(db, "analyst", system, user, max_tokens=700)
-    except Exception:
-        reply = "这套题目已经生成。你可以追问某一题在考什么，或直接发起模拟面试。"
+    history = _history_lines(session, 8)
+    prompt = {
+        "system": "你是模拟面试训练助手。回答用户对题目或岗位知识的追问。不要重新出一整套题。不要使用「对弈」「博弈」「棋」等字眼。",
+        "user": f"已有题目：\n{stems}\n\n知识片段：\n{knowledge_block}\n\n最近对话：\n{history}\n\n用户：{content}",
+        "fallback": "这套题目已经生成。你可以追问某一题在考什么，或直接发起模拟面试。",
+    }
     extra = {
         "kind": "followup",
         "question_set_id": qset.id,
-        "thinking": "对照已有题目和知识片段，只回答这一问，不重新出一整套题。",
         "actions": ["直接发起一场 30 分钟全真模拟面试实战"],
     }
-    return reply, extra
+    return prompt, extra
+
+
+async def _iter_parts_or_fallback(db: Session, prompt: dict[str, str]) -> AsyncIterator[tuple[str, str]]:
+    """模型流中断时改交兜底句。已经吐出的半句由调用方决定是否保留。"""
+    try:
+        async for kind, delta in stream_parts(db, "analyst", prompt["system"], prompt["user"], max_tokens=ANSWER_MAX_TOKENS):
+            yield kind, delta
+    except Exception:
+        yield "content", prompt["fallback"]
 
 
 def _recent_dialogue(session: ChatSession) -> str:
     """Give the perception agent only the previous turns, not the current one."""
-    lines = [f"{message.role}: {message.content[:200]}" for message in (session.messages or [])[-6:-1]]
+    lines = _history_lines(session, 6).splitlines()
+    return "\n".join(lines[:-1])
+
+
+def _history_lines(session: ChatSession, limit: int) -> str:
+    """只拼接真正的文本消息。测试替身或空正文不进提示词。"""
+    lines: list[str] = []
+    for message in list(session.messages or [])[-limit:]:
+        content = getattr(message, "content", "")
+        role = getattr(message, "role", "")
+        if not isinstance(content, str) or not isinstance(role, str):
+            continue
+        lines.append(f"{role}: {content[:400]}")
     return "\n".join(lines)
 
 
@@ -364,7 +530,6 @@ def _clarification_from_intent(content: str, intent: dict[str, Any]) -> tuple[st
         {
             "kind": "clarification",
             "source": content,
-            "thinking": "这一句还不能直接出题。按这句话确认缺少的方向，再继续。",
             "todos": todos,
             "questions": questions,
         },
@@ -388,13 +553,6 @@ def _answers_text(pending: dict[str, Any], answers: list[dict[str, Any]]) -> str
     source = str(pending.get("source") or "").strip()
     chosen = "、".join(labels) or "已选择"
     return f"按「{source}」准备，方向是{chosen}。" if source else f"方向是{chosen}。"
-
-
-def _thinking_for_pack(job_title: str, focus: list[Any], hits: list[dict[str, Any]]) -> str:
-    points = "、".join(str(item) for item in focus[:4] if item) or "岗位职责"
-    sources = "、".join(str(hit.get("filename") or "") for hit in hits[:3] if hit.get("filename"))
-    source_line = f"对照了知识库里的{sources}。" if sources else "知识库没有命中，只按岗位描述出题。"
-    return f"先把「{job_title}」拆成{points}。{source_line}题目会围着这些点，而不是再写一份泛泛的题库。"
 
 
 def _short_label(text: str, limit: int = 18) -> str:

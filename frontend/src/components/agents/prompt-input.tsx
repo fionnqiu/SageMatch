@@ -60,6 +60,8 @@ export interface PromptInputProps extends Omit<
   onSubmit?: (value: string, model?: string) => void | Promise<void>;
   loading?: boolean;
   onStop?: () => void;
+  /** 输入框为空但已挂上附件时，仍允许和附件一起提交。 */
+  allowEmpty?: boolean;
   minRows?: number;
   maxRows?: number;
   leadingAction?: ReactNode;
@@ -79,6 +81,7 @@ export function PromptInput({
   onSubmit,
   loading = false,
   onStop,
+  allowEmpty = false,
   minRows = 2,
   maxRows = 8,
   leadingAction,
@@ -102,7 +105,7 @@ export function PromptInput({
   const currentModel = models.find(
     (option) => option.value === currentModelValue,
   );
-  const canSubmit = Boolean(currentValue.trim()) && !disabled && !loading;
+  const canSubmit = (Boolean(currentValue.trim()) || allowEmpty) && !disabled && !loading;
 
   const resizeTextarea = useCallback(() => {
     const textarea = textareaRef.current;
@@ -143,7 +146,7 @@ export function PromptInput({
   const submit = (event?: FormEvent) => {
     event?.preventDefault();
     const prompt = currentValue.trim();
-    if (!prompt || disabled || loading) return;
+    if ((!prompt && !allowEmpty) || disabled || loading) return;
 
     onSubmit?.(prompt, currentModelValue);
     if (value === undefined) setInternalValue("");

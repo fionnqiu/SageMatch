@@ -73,6 +73,11 @@ class PerceptionChoices(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["source"], "fallback")
 
 
+def _prompt(reply: str) -> dict[str, str]:
+    # 整段发送会再调一次模型。测试把准备好的兜底句当成模型结果，避免真的打供应商。
+    return {"system": "test", "user": "test", "fallback": reply}
+
+
 class _Db:
     def add(self, _row: object) -> None:
         return None
@@ -94,7 +99,11 @@ class ChatRouting(unittest.IsolatedAsyncioTestCase):
             patch("app.services.session.ChatSession") as session_cls,
             patch("app.services.session.ChatMessage"),
             patch("app.services.session.resolve_intent", new=AsyncMock(return_value=decision)),
-            patch("app.services.session.answer_directly", new=AsyncMock(return_value=("直接回答。", {"kind": "answer"}))) as answer,
+            patch(
+                "app.services.session.prepare_direct_answer",
+                new=AsyncMock(return_value=(_prompt("直接回答。"), {"kind": "answer"})),
+            ),
+            patch("app.services.session.complete", new=AsyncMock(return_value="直接回答。")) as answer,
             patch("app.services.session.generate_and_store", new=AsyncMock()) as generate,
             patch("app.services.session.now", return_value=None),
         ):
@@ -126,9 +135,9 @@ class ChatRouting(unittest.IsolatedAsyncioTestCase):
                 }
             return {"intent": "answer", "needs_recall": False, "todos": []}
 
-        async def answer(_db: object, _session: object, content: str, _intent: dict) -> tuple[str, dict]:
+        async def answer(_db: object, _session: object, content: str, _intent: dict) -> tuple[dict, dict]:
             seen.append(content)
-            return "我可以帮你准备岗位、出题，也可以直接讲一个知识点。", {"kind": "answer"}
+            return _prompt("我可以帮你准备岗位、出题，也可以直接讲一个知识点。"), {"kind": "answer"}
 
         with (
             patch("app.services.session.get_session", return_value=None),
@@ -136,7 +145,7 @@ class ChatRouting(unittest.IsolatedAsyncioTestCase):
             patch("app.services.session.ChatSession") as session_cls,
             patch("app.services.session.ChatMessage") as message_cls,
             patch("app.services.session.resolve_intent", new=decide),
-            patch("app.services.session.answer_directly", new=answer),
+            patch("app.services.session.prepare_direct_answer", new=answer),
             patch("app.services.session.generate_and_store", new=AsyncMock()) as generate,
             patch("app.services.session.now", return_value=None),
         ):
@@ -166,7 +175,11 @@ class ChatRouting(unittest.IsolatedAsyncioTestCase):
             patch("app.services.session.latest_question_set_for_session", return_value=None),
             patch("app.services.session.ChatMessage"),
             patch("app.services.session.resolve_intent", new=decide),
-            patch("app.services.session.answer_directly", new=AsyncMock(return_value=("按这个方向说明。", {"kind": "answer"}))) as answer,
+            patch(
+                "app.services.session.prepare_direct_answer",
+                new=AsyncMock(return_value=(_prompt("按这个方向说明。"), {"kind": "answer"})),
+            ),
+            patch("app.services.session.complete", new=AsyncMock(return_value="按这个方向说明。")) as answer,
             patch("app.services.session.generate_and_store", new=AsyncMock()) as generate,
             patch("app.services.session.now", return_value=None),
         ):
@@ -191,19 +204,19 @@ class ChatRouting(unittest.IsolatedAsyncioTestCase):
         """Only the opening user message becomes the history title."""
         db = _Db()
 
-        async def name(_db: object, _role: str, _system: str, user: str, **_kwargs: object) -> str:
-            self.assertIn("你好", user)
-            return "打招呼"
-
         with (
             patch("app.services.session.get_session", return_value=None),
             patch("app.services.session.latest_question_set_for_session", return_value=None),
             patch("app.services.session.ChatSession") as session_cls,
             patch("app.services.session.ChatMessage"),
             patch("app.services.session.resolve_intent", new=AsyncMock(return_value={"intent": "answer"})),
-            patch("app.services.session.answer_directly", new=AsyncMock(return_value=("你好。", {"kind": "answer"}))),
+            patch(
+                "app.services.session.prepare_direct_answer",
+                new=AsyncMock(return_value=(_prompt("你好。"), {"kind": "answer"})),
+            ),
             patch("app.services.session.generate_and_store", new=AsyncMock()),
-            patch("app.services.session.complete", new=name),
+            patch("app.services.session.complete", new=AsyncMock(return_value="你好。")),
+            patch("app.services.session.session_title", new=AsyncMock(return_value="打招呼")) as name,
             patch("app.services.session.now", return_value=None),
         ):
             session = session_cls.return_value
@@ -211,4 +224,5 @@ class ChatRouting(unittest.IsolatedAsyncioTestCase):
             session.messages = []
             session.title = "新会话"
             await send_chat(db, "你好", None)
+        name.assert_awaited()
         self.assertEqual(session.title, "打招呼")

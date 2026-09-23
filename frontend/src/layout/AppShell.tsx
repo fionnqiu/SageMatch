@@ -18,8 +18,8 @@ export function AppShell() {
   async function refresh(preferredId?: string) {
     const list = await api.sessions();
     setSessions(list);
-    // Draft (no messages yet) may not be in history; keep it as current anyway.
-    const next = preferredId || currentId || list[0]?.id || null;
+    // 刷新不自动打开最近一条。只有调用方明确指定，或用户已经点开某条时才选中。
+    const next = preferredId || currentId || null;
     setCurrentId(next);
     return next;
   }

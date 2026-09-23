@@ -33,8 +33,17 @@ class ClarificationAnswerIn(BaseModel):
     prompt: str = ""
 
 
+class ChatAttachmentIn(BaseModel):
+    """随这条消息一起提交的附件。正文已在前端读出，气泡只展示文件名。"""
+
+    name: str
+    size: int = 0
+    text: str = ""
+
+
 class ChatSendIn(BaseModel):
     content: str = ""
     session_id: str | None = None
     # 仅用于回复上一轮澄清题。普通消息留空。
     answers: list[ClarificationAnswerIn] = Field(default_factory=list)
+    attachments: list[ChatAttachmentIn] = Field(default_factory=list)

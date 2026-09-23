@@ -2,20 +2,29 @@
 
 from __future__ import annotations
 
+import io
 import re
+import zipfile
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 from app.rag_config import get_rag_config
 
 # 与切块窗口同一套计数：英文词 / 数字串 / 单汉字 / 标点各 1 token；空白不计。
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]|[^\sA-Za-z0-9_\u4e00-\u9fff]+|\s+")
+_DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 
 def parse_bytes(filename: str, data: bytes) -> str:
-    """Extract UTF-8-ish text from txt/md/pdf. PDF is best-effort Latin-1 stream scrape."""
+    """Extract text from txt/md/pdf/docx. Binary office files are never decoded as UTF-8."""
     name = filename.lower()
     if name.endswith(".pdf"):
         return _pdf_text(data)
+    # docx 是 zip。直接 decode 会把 PK 头和 XML 当正文，所以先按段落抽出 w:t。
+    if name.endswith(".docx") or _is_zip(data):
+        return _docx_text(data)
+    if name.endswith(".doc"):
+        raise ValueError("暂不支持旧版 .doc，请另存为 .docx")
     text = data.decode("utf-8", errors="ignore")
     if not text.strip():
         text = data.decode("gb18030", errors="ignore")
@@ -116,6 +125,30 @@ def recall(query: str, rows: list[dict], k: int | None = None, query_vec: list[f
 def terms(text: str) -> set[str]:
     words = re.findall(r"[A-Za-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", text.lower())
     return set(words)
+
+
+def _is_zip(data: bytes) -> bool:
+    return data[:2] == b"PK"
+
+
+def _docx_text(data: bytes) -> str:
+    """Read document.xml paragraphs. Stdlib only, so chat upload does not need python-docx."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            xml = archive.read("word/document.xml")
+    except (zipfile.BadZipFile, KeyError) as exc:
+        raise ValueError("无法读取这份 Word 文件") from exc
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError as exc:
+        raise ValueError("无法读取这份 Word 文件") from exc
+    lines: list[str] = []
+    for para in root.iterfind(".//w:p", _DOCX_NS):
+        bits = [node.text or "" for node in para.iterfind(".//w:t", _DOCX_NS)]
+        line = "".join(bits).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def _pdf_text(data: bytes) -> str:

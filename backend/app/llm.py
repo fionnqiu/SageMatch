@@ -1,17 +1,20 @@
-"""Thin Anthropic / OpenAI-compatible client. Falls back to a local stub if no key is set."""
+"""OpenAI Chat Completions client. Thinking and streaming are always on for text chat."""
 
 from __future__ import annotations
 
 import json
 import re
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
-from anthropic import AsyncAnthropic
 
 from app.config import get_settings
 from app.rag_config import get_rag_config
+
+# 文本对话只走 OpenAI Chat Completions。思考和流式写死开启，不进供应商配置。
+CHAT_PROTOCOL = "openai_chat"
 
 
 def llm_available(api_key: str | None = None) -> bool:
@@ -29,7 +32,7 @@ async def complete_json(
     model: str | None = None,
     temperature: float = 0.4,
     top_p: float | None = None,
-    protocol: str = "anthropic_messages",
+    protocol: str = CHAT_PROTOCOL,
 ) -> dict[str, Any]:
     """Ask the model for a JSON object. Stub path returns a canned payload."""
     raw = await complete_text(
@@ -56,7 +59,7 @@ async def complete_text(
     model: str | None = None,
     temperature: float = 0.4,
     top_p: float | None = None,
-    protocol: str = "anthropic_messages",
+    protocol: str = CHAT_PROTOCOL,
 ) -> str:
     settings = get_settings()
     gen = get_rag_config().generation
@@ -66,10 +69,21 @@ async def complete_text(
     nucleus = gen.top_p if top_p is None else top_p
     if not key:
         raise RuntimeError("LLM_API_KEY is empty")
-
-    if protocol.startswith("openai"):
-        return await _openai_chat(key, url, mdl, system, user, max_tokens, temperature, nucleus)
-    return await _anthropic_messages(key, url, mdl, system, user, max_tokens, temperature, nucleus)
+    # 文本对话不再看供应商上的协议名。思考和流式都在 stream_text 里写死。
+    del protocol
+    parts: list[str] = []
+    async for delta in stream_text(
+        system,
+        user,
+        max_tokens=max_tokens,
+        api_key=key,
+        base_url=url,
+        model=mdl,
+        temperature=temperature,
+        top_p=nucleus,
+    ):
+        parts.append(delta)
+    return "".join(parts).strip()
 
 
 def openai_root(base_url: str) -> str:
@@ -80,11 +94,13 @@ def openai_root(base_url: str) -> str:
 
 
 async def list_models(protocol: str, api_key: str, base_url: str) -> list[str]:
-    """Probe vendor model list. OpenAI-compatible /models; Anthropic-compatible same path as fallback."""
+    """Probe the OpenAI-compatible /models list."""
     if not api_key:
         raise ValueError("请先填写 API Key")
     if protocol.startswith("websocket"):
         raise ValueError("WebSocket 音频协议不提供模型列表，请手填模型名")
+    if protocol not in {CHAT_PROTOCOL, "openai_embeddings", "openai_embed"} and not protocol.startswith("openai"):
+        raise ValueError("只支持 OpenAI Chat Completions")
     headers = {"Authorization": f"Bearer {api_key}", "x-api-key": api_key, "Content-Type": "application/json"}
     urls = [f"{openai_root(base_url)}/models"]
     last_err = "无法获取模型列表"
@@ -133,15 +149,23 @@ async def ping_provider(
     """
     started = time.perf_counter()
     try:
-        if capability in {"asr", "tts"} and protocol.startswith("openai"):
+        if capability in {"asr", "tts"}:
             # 只验证密钥和地址。语音模型经常不出现在 /models，缺席不算失败。
-            await list_models(protocol, api_key, base_url)
+            await list_models(CHAT_PROTOCOL, api_key, base_url)
         elif protocol in {"openai_embeddings", "openai_embed"}:
             await embed_texts(["ping"], api_key=api_key, base_url=base_url, model=model or "text-embedding-3-small")
-        elif protocol.startswith("openai"):
-            await _openai_chat(api_key, base_url, model or "gpt-4o-mini", "ping", "回复 ok", 8, 0, 1.0)
-        elif protocol in {"anthropic_messages", "anthropic"}:
-            await _anthropic_messages(api_key, base_url, model or get_settings().llm_model, "ping", "回复 ok", 8, 0, 1.0)
+        elif protocol == CHAT_PROTOCOL or protocol.startswith("openai") or protocol.startswith("anthropic"):
+            # 连通性也走写死的思考加流式，避免探测请求和正式调用不是同一条协议。
+            await complete_text(
+                "ping",
+                "回复 ok",
+                max_tokens=8,
+                api_key=api_key,
+                base_url=base_url,
+                model=model or "gpt-4o-mini",
+                temperature=0,
+                top_p=1.0,
+            )
         else:
             return False, 0, "WebSocket 音频协议本期不测连通性"
         ms = int((time.perf_counter() - started) * 1000)
@@ -151,68 +175,112 @@ async def ping_provider(
         return False, ms, str(exc)[:240]
 
 
-async def _anthropic_messages(
-    api_key: str,
-    base_url: str,
-    model: str,
+async def stream_text(
     system: str,
     user: str,
-    max_tokens: int,
-    temperature: float,
-    top_p: float,
-) -> str:
-    kwargs: dict[str, Any] = {"api_key": api_key, "timeout": 45.0}
-    if base_url:
-        kwargs["base_url"] = base_url
-    client = AsyncAnthropic(**kwargs)
-    create_kwargs: dict[str, Any] = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
-    }
-    # Anthropic 不允许 temperature 与 top_p 同时传；1.0 视为关闭核采样。
-    if 0 < top_p < 1:
-        create_kwargs["top_p"] = top_p
-        create_kwargs.pop("temperature", None)
-    resp = await client.messages.create(**create_kwargs)
-    parts: list[str] = []
-    for block in resp.content:
-        text = getattr(block, "text", None)
-        if text:
-            parts.append(text)
-    return "".join(parts).strip()
+    *,
+    max_tokens: int = 900,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    temperature: float = 0.4,
+    top_p: float | None = None,
+) -> AsyncIterator[str]:
+    """只交出正文。整段调用不需要思考过程。"""
+    async for kind, delta in stream_chat_parts(
+        system,
+        user,
+        max_tokens=max_tokens,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        temperature=temperature,
+        top_p=top_p,
+    ):
+        if kind == "content" and delta:
+            yield delta
 
 
-async def _openai_chat(
-    api_key: str,
-    base_url: str,
-    model: str,
+async def stream_chat_parts(
     system: str,
     user: str,
-    max_tokens: int,
-    temperature: float,
-    top_p: float,
-) -> str:
-    root = openai_root(base_url)
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    *,
+    max_tokens: int = 900,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    temperature: float = 0.4,
+    top_p: float | None = None,
+) -> AsyncIterator[tuple[str, str]]:
+    """逐块交出 reasoning 或 content。思考不混进正式回答。"""
+    settings = get_settings()
+    gen = get_rag_config().generation
+    key = api_key if api_key is not None else settings.llm_api_key
+    url = base_url if base_url is not None else settings.llm_base_url
+    mdl = model or settings.llm_model
+    nucleus = gen.top_p if top_p is None else top_p
+    if not key:
+        raise RuntimeError("LLM_API_KEY is empty")
+    root = openai_root(url)
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     body: dict[str, Any] = {
-        "model": model,
+        "model": mdl,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "stream": True,
+        # 千问兼容接口用 extra 字段开关思考。思考文本只在流里拼接，不返回给调用方。
+        "enable_thinking": True,
+        "stream_options": {"include_usage": True},
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
     }
-    if 0 < top_p <= 1:
-        body["top_p"] = top_p
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        res = await client.post(f"{root}/chat/completions", headers=headers, json=body)
-        res.raise_for_status()
-        data = res.json()
-    return (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    if 0 < nucleus <= 1:
+        body["top_p"] = nucleus
+    # 思考模型首 token 可能很晚。读超时按块计算，不按整段回答计算。
+    timeout = httpx.Timeout(180.0, connect=15.0, read=60.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", f"{root}/chat/completions", headers=headers, json=body) as res:
+            res.raise_for_status()
+            async for kind, delta in _iter_chat_parts(res):
+                yield kind, delta
+
+
+async def _iter_chat_parts(res: httpx.Response) -> AsyncIterator[tuple[str, str]]:
+    """思考和正文分开。reasoning_content 只作为思考过程，不进入回答。"""
+    async for line in res.aiter_lines():
+        payload = line.strip()
+        if not payload.startswith("data:"):
+            continue
+        data = payload[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        choices = chunk.get("choices") if isinstance(chunk, dict) else None
+        if not choices:
+            continue
+        delta = (choices[0] or {}).get("delta") or {}
+        choice = choices[0] or {}
+        # thinking 是模型当下正在想什么，reasoning 是推理过程。同一块里两者都要交出去，不能因为先读到一个就把另一个丢掉。
+        thinking = delta.get("thinking") or choice.get("thinking")
+        reasoning = (
+            delta.get("reasoning_content")
+            or delta.get("reasoning")
+            or delta.get("reasoning_text")
+            or choice.get("reasoning_content")
+            or choice.get("reasoning")
+        )
+        content = delta.get("content")
+        if thinking:
+            yield "thinking", str(thinking)
+        if reasoning:
+            yield "reasoning", str(reasoning)
+        if content:
+            yield "content", str(content)
 
 
 def _extract_json(raw: str) -> dict[str, Any]:

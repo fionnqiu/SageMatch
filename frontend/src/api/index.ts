@@ -14,7 +14,7 @@ export type { EvalRun } from "./eval";
 export type { Interview, InterviewTurn, Question, Report } from "./interview";
 export type { Material, RecallHit } from "./knowledge";
 export type { Provider, RoleBinding } from "./providers";
-export type { ActivityTodo, ChatMessage, ChatSession, ClarificationAnswer, ClarificationQuestion } from "./session";
+export type { ActivityTodo, ChatAttachment, ChatMessage, ChatSession, ChatStreamEvent, ClarificationAnswer, ClarificationQuestion } from "./session";
 
 export const api = {
   ...sessionApi,

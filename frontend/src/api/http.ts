@@ -40,3 +40,47 @@ export async function sendFile<T>(path: string, file: File, extra?: Record<strin
   }
   return res.json() as Promise<T>;
 }
+
+export async function readEventStream(
+  path: string,
+  body: unknown,
+  onEvent: (event: Record<string, unknown>) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  // 不用 EventSource。发送要带 JSON，而且这一轮不能在断线后自动重放。
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    const text = await res.text();
+    try {
+      const parsed = JSON.parse(text) as { detail?: string };
+      throw new Error(parsed.detail || text || res.statusText);
+    } catch (err) {
+      if (err instanceof Error && err.message !== text) throw err;
+      throw new Error(text || res.statusText);
+    }
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() || "";
+    for (const frame of frames) {
+      const data = frame
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim())
+        .join("\n");
+      if (!data) continue;
+      onEvent(JSON.parse(data) as Record<string, unknown>);
+    }
+  }
+}

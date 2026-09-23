@@ -4,21 +4,16 @@ import { SPRING_LAYOUT } from "../../lib/ease";
 import { useNavigate, useOutletContext } from "react-router-dom";
 import {
   Bot,
-  Check,
-  ChevronDown,
-  Circle,
-  Copy,
   FileText,
-  LoaderCircle,
   Mic,
   Paperclip,
-  RotateCcw,
   Sparkles,
   User,
   X,
 } from "lucide-react";
-import { api, type ActivityTodo, type ChatMessage, type ChatSession, type ClarificationAnswer } from "../../api";
+import { api, type ChatAttachment, type ChatMessage, type ChatSession, type ClarificationAnswer } from "../../api";
 import { PromptInput } from "../../components/agents/prompt-input";
+import { StreamingResponse } from "../../components/agents/streaming-response";
 import { MarkdownView } from "../../components/MarkdownView";
 import { notify } from "../../lib/notify";
 import type { AppOutlet } from "./outlet";
@@ -39,13 +34,21 @@ export function SessionPage() {
   const { currentId, setCurrentId, refresh } = useOutletContext<AppOutlet>();
   const [current, setCurrent] = useState<ChatSession | null>(null);
   const [draft, setDraft] = useState("");
+  // 选中的文件先挂在输入框上。点发送才和文字一起出去。
+  const [pendingFiles, setPendingFiles] = useState<ChatAttachment[]>([]);
+  const [preparing, setPreparing] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [pendingText, setPendingText] = useState("");
   const [revealId, setRevealId] = useState("");
   // 正文已经播完的那条。revealId 还留着，避免回答组件被重置后从头再播。
   const [settledId, setSettledId] = useState("");
+  // 真流式正文播完的那条。思考留到这一刻再藏，不能在第一个字到达时就收。
+  const [streamSettledId, setStreamSettledId] = useState("");
+  // 本轮等待开始的时间。思考标签只显示耗时，不再记录思考正文。
+  const [thinkingStartedAt, setThinkingStartedAt] = useState(0);
   // 本轮发出、后端还没回写的用户消息。避免等待时列表仍停在上一轮。
   const [pendingUser, setPendingUser] = useState<ChatMessage | null>(null);
+  // 模型已经吐出、但还没落库的回答。done 到达后由正式消息替换。
+  const [liveReply, setLiveReply] = useState<ChatMessage | null>(null);
   const streamRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const reduceMotion = useReducedMotion() ?? false;
@@ -59,73 +62,168 @@ export function SessionPage() {
   }, [currentId]);
 
   useEffect(() => {
+    // 真流式不会增加消息条数。正文变长时也要跟着滚到底。
     streamRef.current?.scrollTo({ top: streamRef.current.scrollHeight, behavior: "smooth" });
-  }, [current?.messages?.length, busy]);
+  }, [current?.messages?.length, busy, liveReply?.content, liveReply?.extra?.thinking, liveReply?.extra?.reasoning]);
 
   async function onSend(text?: string, answers?: ClarificationAnswer[]) {
     const content = (text ?? draft).trim();
-    if ((!content && !answers?.length) || busy) return;
+    const files = text === undefined && !answers?.length ? pendingFiles : [];
+    if ((!content && !answers?.length && !files.length) || busy || preparing) return;
     const controller = new AbortController();
     abortControllers.add(controller);
     setDraft("");
-    setPendingText(content);
+    setPendingFiles([]);
     // 上一轮的展开标记必须先清掉，否则等待期间会把旧回答重新播一遍。
     setRevealId("");
     setSettledId("");
+    setStreamSettledId("");
+    setThinkingStartedAt(Date.now());
+    setLiveReply(null);
     setPendingUser(
-      content
+      content || files.length
         ? {
             id: `pending-${Date.now()}`,
             role: "user",
             content,
+            extra: files.length ? { kind: "attachment", files: files.map(({ name, size }) => ({ name, size })) } : null,
             created_at: new Date().toISOString(),
           }
         : null,
     );
     setBusy(true);
     try {
-      const next = await api.chat(content, current?.id, answers, controller.signal);
-      if (controller.signal.aborted) return;
-      // 任意新助手回复都走流式展开，不只限知识问答。历史消息没有这个 id，仍一次显示。
-      const latest = [...(next.messages || [])].reverse().find((item) => item.role === "assistant");
-      if (latest) setRevealId(latest.id);
-      setPendingUser(null);
-      setCurrent(next);
-      setCurrentId(next.id);
-      await refresh(next.id);
+      let blocked = false;
+      let streamed = "";
+      let thought = "";
+      let rationale = "";
+      let finishedId = current?.id || "";
+      const resumeId = { current: finishedId };
+      await api.streamChat(content, current?.id, answers, files, (event) => {
+        if (controller.signal.aborted) return;
+        if (event.type === "blocked") {
+          blocked = true;
+          return;
+        }
+        if (event.type === "meta") {
+          // 思考可能先于正文到达。气泡先占位，标签展开后再填思考文本。
+          setLiveReply({
+            id: "live-reply",
+            role: "assistant",
+            content: "",
+            extra: event.extra,
+            created_at: new Date().toISOString(),
+          });
+          setRevealId("live-reply");
+          if (event.session_id) {
+            finishedId = event.session_id;
+            resumeId.current = event.session_id;
+            setCurrentId(event.session_id);
+          }
+          return;
+        }
+        if (event.type === "thinking" || event.type === "reasoning") {
+          if (event.type === "thinking") thought += event.text;
+          else rationale += event.text;
+          const thinkingText = thought;
+          const reasoningText = rationale;
+          // 思考块可能比 meta 更早到。没有占位消息时也要先建出来，否则这段思考会被丢掉。
+          setLiveReply((item) => ({
+            id: item?.id || "live-reply",
+            role: "assistant",
+            content: item?.content || "",
+            extra: {
+              ...(item?.extra || {}),
+              ...(thinkingText ? { thinking: thinkingText } : {}),
+              ...(reasoningText ? { reasoning: reasoningText } : {}),
+            },
+            created_at: item?.created_at || new Date().toISOString(),
+          }));
+          setRevealId("live-reply");
+          return;
+        }
+        if (event.type === "delta") {
+          streamed += event.text;
+          const text = streamed;
+          setLiveReply((item) => (item ? { ...item, content: text } : item));
+          return;
+        }
+        if (event.type === "done") {
+          const messages = [...(event.session.messages || [])];
+          const latest = [...messages].reverse().find((item) => item.role === "assistant");
+          if (latest && (thought || rationale)) {
+            // 流里已经看到的思考和推理不能在换成正式消息时丢掉。库里已有的字段优先。
+            latest.extra = {
+              ...(latest.extra || {}),
+              ...(!latest.extra?.thinking && thought ? { thinking: thought } : {}),
+              ...(!latest.extra?.reasoning && rationale ? { reasoning: rationale } : {}),
+            };
+          }
+          setLiveReply(null);
+          setPendingUser(null);
+          setCurrent({ ...event.session, messages });
+          finishedId = event.session.id;
+          setCurrentId(event.session.id);
+          // 正文已经按增量显示过。换成落库消息后直接标完成，避免再播一遍。
+          // 思考也在这一刻收掉。不跟 live-reply 的 id 走，换消息时不会闪回来。
+          if (latest) {
+            setRevealId(latest.id);
+            setSettledId(latest.id);
+            setStreamSettledId(latest.id);
+          }
+        }
+      }, controller.signal);
+      if (controller.signal.aborted) {
+        // 停止只打断前端。用户消息已经落库时，把这一轮已保存的内容拉回来。
+        if (resumeId.current) {
+          const saved = await api.session(resumeId.current);
+          setCurrent(saved);
+          setCurrentId(saved.id);
+        }
+        setPendingUser(null);
+        setLiveReply(null);
+        return;
+      }
+      if (blocked) {
+        const next = await api.chat(content, current?.id, answers, controller.signal, files);
+        const latest = [...(next.messages || [])].reverse().find((item) => item.role === "assistant");
+        if (latest) setRevealId(latest.id);
+        setPendingUser(null);
+        setCurrent(next);
+        finishedId = next.id;
+        setCurrentId(next.id);
+      }
+      if (finishedId) await refresh(finishedId);
     } catch (err) {
       if (controller.signal.aborted) return;
       setPendingUser(null);
+      setLiveReply(null);
       notify(err instanceof Error ? err.message : "发送失败", "error");
     } finally {
       abortControllers.delete(controller);
-      setPendingText("");
       setBusy(false);
     }
   }
 
   function stopRun() {
-    // 只停前端等待。后端若已写完这一轮，刷新会话仍能看到结果。
+    // 只停前端读取。abort 后的收尾会把已经落库的用户消息拉回来。
     for (const controller of abortControllers) controller.abort();
     abortControllers.clear();
-    setPendingUser(null);
-    setBusy(false);
   }
 
-  async function onUpload(file: File) {
-    setBusy(true);
+  async function onPickFile(file: File) {
+    // 先解析，解析完只放进输入框。失败时不占住发送中的状态。
+    setPreparing(true);
     try {
-      const next = await api.chatUpload(file, current?.id);
-      setRevealId("");
-      const latest = [...(next.messages || [])].reverse().find((item) => item.role === "assistant");
-      if (latest) setRevealId(latest.id);
-      setCurrent(next);
-      setCurrentId(next.id);
-      await refresh(next.id);
+      const prepared = await api.prepareChatFile(file);
+      setPendingFiles((items) => {
+        const next = items.filter((item) => item.name !== prepared.name);
+        return [...next, prepared];
+      });
     } catch (err) {
-      notify(err instanceof Error ? err.message : "上传失败", "error");
+      notify(err instanceof Error ? err.message : "附件读取失败", "error");
     } finally {
-      setBusy(false);
+      setPreparing(false);
     }
   }
 
@@ -138,7 +236,7 @@ export function SessionPage() {
     }
   }
 
-  const messages = [...(current?.messages || []), ...(pendingUser ? [pendingUser] : [])];
+  const messages = [...(current?.messages || []), ...(pendingUser ? [pendingUser] : []), ...(liveReply ? [liveReply] : [])];
   const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
   const actions = lastAssistant?.extra?.kind === "clarification" ? [] : lastAssistant?.extra?.actions || [];
   const empty = !busy && messages.length === 0;
@@ -152,7 +250,7 @@ export function SessionPage() {
         className="hidden"
         onChange={(e) => {
           const file = e.target.files?.[0];
-          if (file) onUpload(file);
+          if (file) void onPickFile(file);
           e.target.value = "";
         }}
       />
@@ -162,8 +260,11 @@ export function SessionPage() {
           draft={draft}
           setDraft={setDraft}
           busy={busy}
+          files={pendingFiles}
+          preparing={preparing}
           onSend={onSend}
           onAttach={() => fileRef.current?.click()}
+          onRemoveFile={(name) => setPendingFiles((items) => items.filter((item) => item.name !== name))}
           onStop={() => undefined}
           onChip={(kind) => {
             if (kind === "jd") onSend(SAMPLE_JD);
@@ -193,6 +294,14 @@ export function SessionPage() {
                   enter={msg.id === revealId || msg.id === pendingUser?.id}
                   streaming={msg.id === revealId && msg.id !== settledId}
                   play={msg.id === revealId}
+                  live={msg.id === "live-reply"}
+                  thinking={
+                    msg.id === revealId &&
+                    thinkingStartedAt > 0 &&
+                    streamSettledId !== msg.id &&
+                    (msg.id === "live-reply" || !msg.content)
+                  }
+                  onStreamSettled={() => setStreamSettledId("live-reply")}
                   answered={Boolean(messages[index + 1])}
                   onClarify={(answers) => onSend("", answers)}
                   onSettled={() => {
@@ -205,7 +314,7 @@ export function SessionPage() {
                   }}
                 />
               ))}
-              {busy ? (
+              {busy && !liveReply ? (
                 <motion.div
                   key="thinking"
                   initial={reduceMotion ? false : { opacity: 0, y: 6 }}
@@ -213,7 +322,7 @@ export function SessionPage() {
                   exit={{ opacity: 0, y: 6 }}
                   transition={reduceMotion ? { duration: 0 } : { duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
                 >
-                  <LiveActivity text={pendingText} />
+                  <LiveActivity />
                 </motion.div>
               ) : null}
               {actions.length && !busy ? (
@@ -240,9 +349,12 @@ export function SessionPage() {
                 draft={draft}
                 setDraft={setDraft}
                 busy={busy}
+                files={pendingFiles}
+                preparing={preparing}
                 onSend={() => onSend()}
                 onStop={stopRun}
                 onAttach={() => fileRef.current?.click()}
+                onRemoveFile={(name) => setPendingFiles((items) => items.filter((item) => item.name !== name))}
               />
             </div>
           </div>
@@ -257,27 +369,45 @@ function Turn({
   message,
   streaming,
   play,
+  live,
+  thinking,
   answered,
   enter,
   onClarify,
   onRetry,
   onSettled,
+  onStreamSettled,
 }: {
   message: ChatMessage;
   streaming: boolean;
   play: boolean;
+  /** 这条正文来自模型增量。不再用本地打字机重播。 */
+  live: boolean;
+  /** 回答还没输出完。思考块只活在这一段。 */
+  thinking: boolean;
   answered: boolean;
   /** 只有这一轮新出现的消息入场。历史记录直接就位，避免每次打开都重播。 */
   enter: boolean;
   onClarify: (answers: ClarificationAnswer[]) => void;
   onRetry: () => void;
   onSettled: () => void;
+  /** 真流式正文播完。历史消息没有这条回调。 */
+  onStreamSettled?: () => void;
 }) {
   if (message.role === "user") {
     return (
       <MessageEnter play={enter}>
         <MessageRow from="user" name="你" time={formatTime(message.created_at)}>
-          <Bubble variant="solid">{message.content}</Bubble>
+          <div className="flex flex-col items-end gap-2">
+            {message.extra?.files?.length ? (
+              <div className="flex flex-wrap justify-end gap-2">
+                {message.extra.files.map((file) => (
+                  <FileChip key={file.name} name={file.name} size={file.size} />
+                ))}
+              </div>
+            ) : null}
+            {message.content ? <Bubble variant="solid">{message.content}</Bubble> : null}
+          </div>
         </MessageRow>
       </MessageEnter>
     );
@@ -289,17 +419,24 @@ function Turn({
     <MessageEnter play={enter}>
     <MessageRow from="assistant" name="知弈" time={formatTime(message.created_at)}>
       <div className="flex w-full flex-col gap-2.5">
-        {/* 思考和清单只在这一轮还在输出时显示。正文播完就收起，不留在回答上面。 */}
-        {streaming && extra?.thinking ? <ThinkingBlock text={extra.thinking} live /> : null}
-        {streaming && extra?.todos?.length ? <TodoList items={extra.todos} /> : null}
+        {/* 思考跟着这一轮输出走。正文播完就卸掉，历史消息不再露出。 */}
+        {thinking && (extra?.thinking || extra?.reasoning) ? (
+          <ThinkingBlock thinking={extra.thinking} reasoning={extra.reasoning} live />
+        ) : thinking ? (
+          <ThinkingLabel />
+        ) : null}
+        {message.content ? (
         <Bubble variant="soft">
           <StreamingAnswer
             text={message.content}
             status={play ? "streaming" : "complete"}
+            live={live}
             onRetry={onRetry}
             onSettled={onSettled}
+            onStreamSettled={onStreamSettled}
           />
         </Bubble>
+        ) : null}
         {asks.length ? <ClarificationCard questions={asks} disabled={answered || streaming} onSubmit={onClarify} /> : null}
       </div>
     </MessageRow>
@@ -365,75 +502,79 @@ function Bubble({ variant, children }: { variant: "solid" | "soft"; children: Re
   );
 }
 
-function ThinkingBlock({ text, live }: { text: string; live: boolean }) {
-  const [open, setOpen] = useState(live);
+function ThinkingLabel() {
+  // 思考文本还没到时只留扫光标签。正文一到，调用方会把这块卸掉。
+  return (
+    <div className="flex items-center gap-1.5 text-[13px]" aria-live="polite">
+      <ThinkingOrb />
+      <span className="sage-think-shimmer">正在思考</span>
+    </div>
+  );
+}
+
+function ThinkingBlock({
+  thinking,
+  reasoning,
+  live,
+}: {
+  thinking?: string;
+  reasoning?: string;
+  live: boolean;
+}) {
+  const viewportRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (!live) setOpen(false);
-  }, [live]);
+    // 思考变长时停在最新一行。回答开始后不再强制滚动，避免把用户正在看的段落拽走。
+    const node = viewportRef.current;
+    if (live && node) node.scrollTop = node.scrollHeight;
+  }, [thinking, reasoning, live]);
   return (
-    <div className="w-full max-w-[680px]">
-      <button
-        type="button"
-        onClick={() => setOpen((value) => !value)}
-        className="flex items-center gap-1.5 text-xs text-dim hover:text-mute"
+    <div className="w-full max-w-[420px]">
+      <div className="flex items-center gap-1.5 text-[13px] leading-[18px]" aria-live="polite">
+        {live ? <ThinkingOrb /> : null}
+        {live ? (
+          <span className="sage-think-shimmer font-medium">正在思考</span>
+        ) : (
+          <span className="font-medium text-dim">已思考</span>
+        )}
+      </div>
+      <div
+        ref={viewportRef}
+        className="mt-1.5 max-h-[180px] overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
-        <ChevronDown size={13} className={`transition-transform ${open ? "rotate-0" : "-rotate-90"}`} />
-        <span className={live ? "sage-shimmer" : ""}>{live ? "正在思考" : "思考过程"}</span>
-      </button>
-      {open ? (
-        <div className="mt-1.5 max-h-40 overflow-y-auto border-l border-line pl-3 text-[13px] leading-6 text-mute">{text}</div>
-      ) : null}
+        <div className="flex flex-col gap-2">
+          {thinking ? <ThoughtSection label="Thinking" text={thinking} /> : null}
+          {reasoning ? <ThoughtSection label="Reasoning" text={reasoning} /> : null}
+        </div>
+      </div>
     </div>
   );
 }
 
-function TodoList({ items }: { items: ActivityTodo[] }) {
-  const [open, setOpen] = useState(true);
-  const done = items.filter((item) => item.status === "complete").length;
+function ThoughtSection({ label, text }: { label: string; text: string }) {
   return (
-    <div className="w-full max-w-[420px] rounded-lg border border-line/80 bg-card/80">
-      <button type="button" onClick={() => setOpen((value) => !value)} className="flex w-full items-center justify-between px-2.5 py-1.5 text-[11px]">
-        <span className="text-dim/80">执行清单</span>
-        <span className="flex items-center gap-1.5 text-dim/70">
-          {done}/{items.length}
-          <ChevronDown size={11} className={open ? "" : "-rotate-90"} />
-        </span>
-      </button>
-      {open ? (
-        <ul className="space-y-1 border-t border-line/70 px-2.5 py-1.5">
-          {items.map((item) => (
-            <li key={item.id} className="flex items-center gap-1.5 text-[11px] leading-4 text-mute/55">
-              <TodoMark status={item.status || "pending"} />
-              <span className={item.status === "cancelled" ? "text-faint/70 line-through" : ""}>{item.label}</span>
-            </li>
-          ))}
-        </ul>
-      ) : null}
-    </div>
+    <section>
+      <p className="m-0 text-[11px] font-medium uppercase tracking-[0.04em] text-mute">{label}</p>
+      <p className="m-0 mt-0.5 whitespace-pre-wrap text-[13px] leading-5 text-dim">{text}</p>
+    </section>
   );
 }
 
-function TodoMark({ status }: { status: NonNullable<ActivityTodo["status"]> }) {
-  if (status === "complete") {
-    return (
-      <span className="flex h-3 w-3 items-center justify-center rounded-full bg-forest/80 text-mint-2/80">
-        <Check size={8} />
+function ThinkingOrb() {
+  return (
+    <span className="sage-orb" aria-hidden="true">
+      <span className="sage-orb-stage">
+        <span className="sage-orb-shape sage-orb-a" />
+        <span className="sage-orb-shape sage-orb-b" />
+        <span className="sage-orb-shape sage-orb-c" />
       </span>
-    );
-  }
-  // 进行中用旋转圈，而不是静态闪烁，才能看出这一项正在执行。
-  if (status === "active") return <LoaderCircle size={12} className="sage-spin text-mint/70" />;
-  if (status === "cancelled") return <X size={11} className="text-faint/70" />;
-  return <Circle size={11} className="text-faint/60" />;
+    </span>
+  );
 }
 
-function LiveActivity({ text }: { text: string }) {
-  // 清单要等这一轮真实决定出来。等待时只复述正在看的这句，不先排一套固定步骤。
-  const subject = text.trim().replace(/\s+/g, " ").slice(0, 24);
-  const thinking = subject ? `正在看「${subject}」。` : "正在看这一轮要做什么。";
+function LiveActivity() {
   return (
     <MessageRow from="assistant" name="知弈" time="现在">
-      <ThinkingBlock text={thinking} live />
+      <ThinkingLabel />
     </MessageRow>
   );
 }
@@ -441,65 +582,40 @@ function LiveActivity({ text }: { text: string }) {
 function StreamingAnswer({
   text,
   status,
+  live,
   onRetry,
   onSettled,
+  onStreamSettled,
 }: {
   text: string;
   status: "streaming" | "complete";
+  /** 真流式已经按到达顺序显示。只有整段返回的澄清和出题才走本地打字机。 */
+  live: boolean;
   onRetry: () => void;
   onSettled: () => void;
+  /** 真流式没有本地打字机。done 把状态改成 complete 时，思考才收。 */
+  onStreamSettled?: () => void;
 }) {
-  const [copied, setCopied] = useState(false);
-  const [actionsOn, setActionsOn] = useState(status !== "streaming");
-  const reduceMotion = usePrefersReducedMotion();
-  // 后端仍是整段返回。这里按 beui Streaming Response 的节奏逐字揭开，完成后再露出操作。
-  const { shown, settled } = useStreamedText(text, status === "streaming", reduceMotion);
-
+  const reduceMotion = useReducedMotion() ?? false;
+  const { shown, settled } = useStreamedText(text, status === "streaming" && !live, reduceMotion);
   useEffect(() => {
-    if (status !== "complete" || !settled) {
-      setActionsOn(false);
-      return;
-    }
-    const timer = window.setTimeout(() => setActionsOn(true), reduceMotion ? 0 : 450);
-    return () => window.clearTimeout(timer);
-  }, [reduceMotion, settled, status]);
-
-  useEffect(() => {
-    // 思考标题跟着正文走。字播完就通知外层收起，而不是一直挂到下一条消息。
-    if (status === "streaming" && settled) onSettled();
-  }, [onSettled, settled, status]);
+    // 整段回答在本地播完后收起。真流式由 done 把状态改成 complete。
+    if (!live && status === "streaming" && settled) onSettled();
+    if (live && status === "complete") onStreamSettled?.();
+  }, [live, onSettled, onStreamSettled, settled, status]);
+  const visible = live ? text : shown;
+  const typing = live ? status === "streaming" : !settled;
 
   return (
-    <div data-state={settled && status === "complete" ? "complete" : "streaming"} aria-busy={!settled || status === "streaming"}>
-      <div aria-live="polite">
-        <MarkdownView text={shown || " "} />
-        {!settled ? <span className="sage-caret" aria-hidden="true" /> : null}
-      </div>
-      {actionsOn ? (
-        <div className="sage-actions mt-2 flex items-center gap-1 text-dim">
-          <button
-            type="button"
-            aria-label={copied ? "已复制" : "复制回答"}
-            onClick={async () => {
-              await navigator.clipboard.writeText(text);
-              setCopied(true);
-              window.setTimeout(() => setCopied(false), 1600);
-            }}
-            className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-field hover:text-ink"
-          >
-            {copied ? <Check size={13} /> : <Copy size={13} />}
-          </button>
-          <button
-            type="button"
-            aria-label="重试"
-            onClick={onRetry}
-            className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-field hover:text-ink"
-          >
-            <RotateCcw size={13} />
-          </button>
-        </div>
-      ) : null}
-    </div>
+    <StreamingResponse
+      status={typing ? "streaming" : "complete"}
+      copyText={text}
+      onRetry={onRetry}
+      announce={false}
+    >
+      <MarkdownView text={visible || " "} />
+      {typing ? <span className="sage-caret" aria-hidden="true" /> : null}
+    </StreamingResponse>
   );
 }
 
@@ -570,17 +686,23 @@ function HomeState({
   draft,
   setDraft,
   busy,
+  files,
+  preparing,
   onSend,
   onChip,
   onAttach,
+  onRemoveFile,
   onStop,
 }: {
   draft: string;
   setDraft: (v: string) => void;
   busy: boolean;
+  files: ChatAttachment[];
+  preparing: boolean;
   onSend: () => void;
   onChip: (kind: "jd" | "ask" | "interview") => void;
   onAttach: () => void;
+  onRemoveFile: (name: string) => void;
   onStop: () => void;
 }) {
   return (
@@ -595,7 +717,18 @@ function HomeState({
           <p className="text-[15px] text-mute">发送岗位描述，开始针对性面试训练</p>
         </motion.div>
         <motion.div layoutId="composer" transition={SPRING_LAYOUT} className="w-full">
-          <Composer draft={draft} setDraft={setDraft} busy={busy} onSend={onSend} onAttach={onAttach} onStop={onStop} home />
+          <Composer
+            draft={draft}
+            setDraft={setDraft}
+            busy={busy}
+            files={files}
+            preparing={preparing}
+            onSend={onSend}
+            onAttach={onAttach}
+            onRemoveFile={onRemoveFile}
+            onStop={onStop}
+            home
+          />
         </motion.div>
         <motion.div
           className="flex flex-wrap items-center justify-center gap-2"
@@ -618,6 +751,41 @@ function HomeState({
   );
 }
 
+function formatFileSize(size: number) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${Math.max(1, Math.round(size / 1024))} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function FileChip({
+  name,
+  size,
+  pending = false,
+  onRemove,
+}: {
+  name: string;
+  size: number;
+  pending?: boolean;
+  onRemove?: () => void;
+}) {
+  return (
+    <div className="flex max-w-[240px] items-center gap-2 rounded-xl border border-field-line bg-well px-2.5 py-2">
+      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-forest text-mint-2">
+        <FileText size={15} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-xs text-ink-2">{name}</span>
+        <span className="block text-[11px] text-dim">{pending ? "读取中" : formatFileSize(size)}</span>
+      </span>
+      {onRemove ? (
+        <button type="button" onClick={onRemove} aria-label={`移除 ${name}`} className="text-dim hover:text-ink">
+          <X size={13} />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 function Chip({ icon, label, onClick }: { icon: ReactNode; label: string; onClick: () => void }) {
   return (
     <button
@@ -635,42 +803,59 @@ function Composer({
   setDraft,
   onSend,
   onAttach,
+  onRemoveFile,
   onStop,
   busy,
+  files,
+  preparing,
   home = false,
 }: {
   draft: string;
   setDraft: (v: string) => void;
   onSend: () => void;
   onAttach: () => void;
+  onRemoveFile: (name: string) => void;
   onStop: () => void;
   busy: boolean;
+  files: ChatAttachment[];
+  preparing: boolean;
   home?: boolean;
 }) {
   const reduceMotion = useReducedMotion() ?? false;
   const box = (
-    <PromptInput
-      value={draft}
-      onValueChange={setDraft}
-      onSubmit={() => onSend()}
-      loading={busy}
-      onStop={onStop}
-      minRows={home ? 3 : 2}
-      maxRows={8}
-      placeholder={home ? "粘贴岗位 JD，或描述你要准备的面试方向…" : "继续提问，或发起模拟面试…"}
-      aria-label={home ? "新会话" : "继续对话"}
-      actions={[
-        {
-          value: "file",
-          label: "上传资料",
-          description: "TXT、MD、PDF 或 Word",
-          icon: <Paperclip />,
-        },
-      ]}
-      onAction={(action) => {
-        if (action === "file") onAttach();
-      }}
-    />
+    <div className="flex flex-col gap-2">
+      {files.length || preparing ? (
+        <div className="flex flex-wrap gap-2">
+          {files.map((file) => (
+            <FileChip key={file.name} name={file.name} size={file.size} onRemove={() => onRemoveFile(file.name)} />
+          ))}
+          {preparing ? <FileChip name="正在读取" size={0} pending /> : null}
+        </div>
+      ) : null}
+      <PromptInput
+        value={draft}
+        onValueChange={setDraft}
+        onSubmit={() => onSend()}
+        loading={busy}
+        allowEmpty={files.length > 0 && !preparing}
+        onStop={onStop}
+        minRows={home ? 3 : 2}
+        maxRows={8}
+        placeholder={home ? "粘贴岗位 JD，或描述你要准备的面试方向…" : "继续提问，或发起模拟面试…"}
+        aria-label={home ? "新会话" : "继续对话"}
+        actions={[
+          {
+            value: "file",
+            label: "上传资料",
+            description: "TXT、MD、PDF 或 Word",
+            icon: <Paperclip />,
+          },
+        ]}
+        onAction={(action) => {
+          if (action === "file") onAttach();
+        }}
+      />
+    </div>
   );
   // 首页那个框带着 layoutId，落到对话底部时接着同一条弹簧。减少动态效果时不滑。
   if (home || reduceMotion) return box;
@@ -679,17 +864,6 @@ function Composer({
       {box}
     </motion.div>
   );
-}
-
-function usePrefersReducedMotion() {
-  const [reduce, setReduce] = useState(() => window.matchMedia("(prefers-reduced-motion: reduce)").matches);
-  useEffect(() => {
-    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const sync = () => setReduce(media.matches);
-    media.addEventListener("change", sync);
-    return () => media.removeEventListener("change", sync);
-  }, []);
-  return reduce;
 }
 
 function useStreamedText(text: string, live: boolean, reduceMotion: boolean) {

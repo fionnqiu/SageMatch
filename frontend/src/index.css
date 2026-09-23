@@ -254,7 +254,91 @@ select {
   max-width: 100%;
 }
 
-/* 思考中的状态字。只动透明度，避免整块布局跳动。 */
+/* 思考指示器用 AICSS Orbs 的 B5：两个圆从左交接到右，中间圆只负责呼吸。
+   舞台按 28px 画，再缩到 14px，避免在 12px 字号旁边撑开行高。 */
+.sage-orb {
+  position: relative;
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--color-mint-2);
+}
+.sage-orb-stage {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 28px;
+  height: 28px;
+  transform-origin: 0 0;
+  transform: scale(0.5);
+}
+.sage-orb-shape {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+/* 半个周期错开，焦点上始终只有一个圆，循环点藏在两端的空白里。 */
+.sage-orb-a,
+.sage-orb-c {
+  animation: sage-orb-handoff 2.8s linear infinite both;
+}
+.sage-orb-c {
+  animation-delay: -1.4s;
+}
+.sage-orb-b {
+  animation: sage-orb-breathe 3.6s ease-in-out infinite both;
+}
+@keyframes sage-orb-handoff {
+  0% {
+    opacity: 0;
+    filter: blur(2.4px);
+    transform: translateX(-11px) scale(0.55);
+    animation-timing-function: cubic-bezier(0.33, 1, 0.68, 1);
+  }
+  22% {
+    opacity: 1;
+    filter: blur(0);
+    transform: translateX(-1px) scale(1);
+    animation-timing-function: linear;
+  }
+  37% {
+    opacity: 1;
+    filter: blur(0);
+    transform: translateX(0) scale(1);
+    animation-timing-function: linear;
+  }
+  52% {
+    opacity: 1;
+    filter: blur(0);
+    transform: translateX(1px) scale(1);
+    animation-timing-function: cubic-bezier(0.33, 1, 0.68, 1);
+  }
+  70%,
+  100% {
+    opacity: 0;
+    filter: blur(2.4px);
+    transform: translateX(11px) scale(0.55);
+  }
+}
+@keyframes sage-orb-breathe {
+  0%,
+  100% {
+    opacity: 0.16;
+    filter: blur(2.4px);
+    transform: scale(1.2);
+  }
+  50% {
+    opacity: 0.32;
+    filter: blur(1.6px);
+    transform: scale(0.98);
+  }
+}
 @keyframes sage-shimmer {
   0%,
   100% {
@@ -263,9 +347,6 @@ select {
   50% {
     opacity: 1;
   }
-}
-.sage-shimmer {
-  animation: sage-shimmer 1.4s ease-in-out infinite;
 }
 /* 执行清单进行中的图标。线性旋转，不改行高。 */
 @keyframes sage-spin {
@@ -277,6 +358,32 @@ select {
   animation: sage-spin 0.8s linear infinite;
 }
 /* 流式回答末尾的插入符。只闪透明度，不改变行高。 */
+/* 思考中的标签扫光。只动文字亮度，不改标签尺寸。 */
+.sage-think-shimmer {
+  color: transparent;
+  background: linear-gradient(
+    90deg,
+    var(--color-dim) 0%,
+    var(--color-dim) 30%,
+    color-mix(in srgb, var(--color-dim) 45%, transparent) 50%,
+    var(--color-dim) 70%,
+    var(--color-dim) 100%
+  );
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: sage-think-shine 2.25s cubic-bezier(0.25, 0.1, 0.25, 1) infinite;
+}
+@keyframes sage-think-shine {
+  0%,
+  18% {
+    background-position: 100% 0;
+  }
+  82%,
+  100% {
+    background-position: 0% 0;
+  }
+}
 .sage-caret {
   display: inline-block;
   width: 2px;
@@ -287,26 +394,29 @@ select {
   background: var(--color-mint-2);
   animation: sage-shimmer 0.9s ease-in-out infinite;
 }
-/* 完成动作在正文落定后浮出，对应 Streaming Response 的 actions 入场。 */
-@keyframes sage-actions-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-.sage-actions {
-  animation: sage-actions-in 0.22s ease-out both;
-}
 @media (prefers-reduced-motion: reduce) {
   .sage-shimmer,
+  .sage-think-shimmer,
   .sage-caret,
   .sage-spin,
-  .sage-actions {
+  .sage-orb-a,
+  .sage-orb-b,
+  .sage-orb-c {
     animation: none;
+  }
+  /* 交接停掉后只留焦点上的那一颗，避免三个圆叠成一团。 */
+  .sage-orb-a {
+    opacity: 1;
+    filter: none;
+    transform: none;
+  }
+  .sage-orb-b,
+  .sage-orb-c {
+    opacity: 0;
+  }
+  .sage-think-shimmer {
+    color: var(--color-dim);
+    background: none;
   }
   /* 减少动态效果时颜色仍要过渡，只是缩短到几乎看不出等待。 */
   html,

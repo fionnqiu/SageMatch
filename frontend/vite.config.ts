@@ -14,7 +14,16 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": `http://127.0.0.1:${apiPort}`,
+      "/api": {
+        target: `http://127.0.0.1:${apiPort}`,
+        configure: (proxy) => {
+          proxy.on("proxyRes", (proxyRes, _req, res) => {
+            // 只有事件流关掉缓冲。普通 JSON 仍按 Vite 默认方式转发。
+            const type = String(proxyRes.headers["content-type"] || "");
+            if (type.includes("text/event-stream")) res.setHeader("X-Accel-Buffering", "no");
+          });
+        },
+      },
     },
   },
 });

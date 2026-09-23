@@ -63,7 +63,7 @@ export function AdminProvidersPage() {
               <div className="min-w-0 flex-1">
                 <div className="text-xs text-ink-2">{p.name}</div>
                 <div className="truncate text-[10px] text-dim">
-                  {p.base_url || "未填 Base URL"} · {p.protocol} · {p.key_masked || "无密钥"}
+                  {p.base_url || "未填 Base URL"} · {protocolLabel(p.protocol)} · {p.key_masked || "无密钥"}
                 </div>
               </div>
               <button
@@ -446,13 +446,18 @@ function ProviderModal({
   async function submit() {
     setBusy(true);
     onError("");
-    if (!form.name.trim() || !form.protocol || !form.capability) {
-      onError("请填写名称，并选择协议和能力");
+    if (!form.name.trim() || !form.capability) {
+      onError("请填写名称，并选择能力");
+      return;
+    }
+    const protocol = form.capability === "llm" ? "openai_chat" : form.protocol;
+    if (!protocol) {
+      onError("请选择协议");
       return;
     }
     const payload = {
       name: form.name.trim(),
-      protocol: form.protocol,
+      protocol,
       capability: form.capability,
       base_url: form.base_url.trim(),
       models: selected,
@@ -486,24 +491,34 @@ function ProviderModal({
             <input className="admin-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
           </Field>
           <Field label="协议">
-            <Select
-              aria-label="协议"
-              value={form.protocol}
-              placeholder="选择协议"
-              onChange={(protocol) => setForm({ ...form, protocol })}
-              options={[
-                { value: "anthropic_messages", label: "Anthropic Messages" },
-                { value: "openai_chat", label: "OpenAI Chat Completions" },
-                { value: "websocket_audio", label: "WebSocket Audio" },
-              ]}
-            />
+            {form.capability === "llm" || !form.capability ? (
+              <div className="admin-input flex items-center text-mute">OpenAI Chat Completions</div>
+            ) : (
+              <Select
+                aria-label="协议"
+                value={form.protocol}
+                placeholder="选择协议"
+                onChange={(protocol) => setForm({ ...form, protocol })}
+                options={[
+                  { value: "openai_chat", label: "OpenAI Chat Completions" },
+                  { value: "websocket_audio", label: "WebSocket Audio" },
+                ]}
+              />
+            )}
           </Field>
           <Field label="能力">
             <Select
               aria-label="能力"
               value={form.capability}
               placeholder="选择能力"
-              onChange={(capability) => setForm({ ...form, capability })}
+              onChange={(capability) =>
+                setForm({
+                  ...form,
+                  capability,
+                  // 文本对话没有第二种协议。切到 LLM 时直接写死，避免下拉里还能改。
+                  protocol: capability === "llm" ? "openai_chat" : form.protocol,
+                })
+              }
               options={[
                 { value: "llm", label: "LLM" },
                 { value: "asr", label: "ASR" },
@@ -635,6 +650,14 @@ function ProviderModal({
         </div>
     </DialogFrame>
   );
+}
+
+function protocolLabel(protocol: string) {
+  if (protocol === "openai_chat" || protocol.startsWith("openai") || protocol.startsWith("anthropic")) {
+    return "OpenAI Chat Completions";
+  }
+  if (protocol.startsWith("websocket")) return "WebSocket Audio";
+  return protocol || "未选协议";
 }
 
 function Field({ label, children, wide }: { label: string; children: ReactNode; wide?: boolean }) {

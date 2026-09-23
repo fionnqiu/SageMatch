@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app import llm
 from app.config import get_settings
+from app.llm import CHAT_PROTOCOL
 from app.models import ProviderConfig, RoleBinding
 from app.services.common import audit, new_id
 from app.services.llm_gateway import log_call
@@ -41,8 +42,8 @@ def seed_providers(db: Session) -> None:
         rows = [
             ProviderConfig(
                 id=new_id(),
-                name="Anthropic Messages 兼容端点",
-                protocol="anthropic_messages",
+                name="OpenAI Chat Completions 兼容端点",
+                protocol=CHAT_PROTOCOL,
                 base_url=settings.llm_base_url or "https://movoapi.top",
                 capability="llm",
                 status="configured" if settings.llm_api_key else "missing_key",
@@ -172,7 +173,7 @@ def create_provider(db: Session, payload: dict[str, Any]) -> ProviderConfig:
     row = ProviderConfig(
         id=new_id(),
         name=name,
-        protocol=payload.get("protocol") or "anthropic_messages",
+        protocol=_chat_protocol(payload.get("protocol")),
         base_url=payload.get("base_url") or "",
         capability=payload.get("capability") or "llm",
         api_key=payload.get("api_key") or "",
@@ -191,9 +192,11 @@ def update_provider(db: Session, provider_id: str, payload: dict[str, Any]) -> P
     row = db.get(ProviderConfig, provider_id)
     if not row:
         raise ValueError("供应商不存在")
-    for key in ("name", "protocol", "base_url", "capability", "notes"):
+    for key in ("name", "base_url", "capability", "notes"):
         if key in payload and payload[key] is not None:
             setattr(row, key, payload[key])
+    if payload.get("protocol") is not None:
+        row.protocol = _chat_protocol(payload.get("protocol"), row.capability)
     if payload.get("models") is not None:
         row.models = payload["models"]
     if payload.get("api_key"):
@@ -236,7 +239,7 @@ def delete_provider(db: Session, provider_id: str) -> None:
 
 async def probe_models(db: Session, payload: dict[str, Any]) -> list[str]:
     """List remote models using the form key, or the stored key when editing."""
-    protocol = (payload.get("protocol") or "").strip() or "anthropic_messages"
+    protocol = _chat_protocol(payload.get("protocol"))
     base_url = (payload.get("base_url") or "").strip()
     api_key = (payload.get("api_key") or "").strip()
     provider_id = payload.get("provider_id")
@@ -348,3 +351,13 @@ def update_role(db: Session, role: str, payload: dict[str, Any]) -> RoleBinding:
     db.commit()
     db.refresh(row)
     return row
+
+
+def _chat_protocol(value: object, capability: object = "llm") -> str:
+    """文本对话固定 Chat Completions。语音占位仍可保留 WebSocket，不改成聊天协议。"""
+    protocol = str(value or "").strip()
+    if str(capability or "") in {"asr", "tts"} and protocol.startswith("websocket"):
+        return protocol
+    if protocol in {"openai_embeddings", "openai_embed"}:
+        return protocol
+    return CHAT_PROTOCOL

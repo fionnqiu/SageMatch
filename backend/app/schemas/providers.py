@@ -18,7 +18,7 @@ class ProviderOut(BaseModel):
 
 
 class ProviderProbeIn(BaseModel):
-    protocol: str = "anthropic_messages"
+    protocol: str = "openai_chat"
     base_url: str = ""
     api_key: str | None = None
     provider_id: str | None = None
