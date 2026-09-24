@@ -4,7 +4,14 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.services.intent import resolve_intent
-from app.services.session import _todos_for_answer, _todos_for_pack, send_chat
+from app.services.session import (
+    _todos_for_answer,
+    _todos_for_pack,
+    begin_chat,
+    complete_chat_turn,
+    finish_chat,
+    send_chat,
+)
 
 
 class ChecklistWording(unittest.TestCase):
@@ -79,6 +86,10 @@ def _prompt(reply: str) -> dict[str, str]:
 
 
 class _Db:
+    def __init__(self) -> None:
+        self.commits = 0
+        self.deleted: list[object] = []
+
     def add(self, _row: object) -> None:
         return None
 
@@ -86,7 +97,10 @@ class _Db:
         return None
 
     def commit(self) -> None:
-        return None
+        self.commits += 1
+
+    def delete(self, row: object) -> None:
+        self.deleted.append(row)
 
 
 class ChatRouting(unittest.IsolatedAsyncioTestCase):
@@ -162,7 +176,7 @@ class ChatRouting(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("后端", str(extras[-1]))
 
     async def test_named_interview_request_leaves_the_chat(self) -> None:
-        """「生成一场前端模拟面试」不再在会话里出题，只指向面试页。"""
+        """「生成一场前端模拟面试」跳转，不创建含有出题行为的新历史会话。"""
         db = _Db()
         with (
             patch("app.services.session.get_session", return_value=None),
@@ -174,15 +188,45 @@ class ChatRouting(unittest.IsolatedAsyncioTestCase):
             patch("app.services.session.generate_and_store", new=AsyncMock()) as generate,
             patch("app.services.session.now", return_value=None),
         ):
-            session = session_cls.return_value
-            session.id = "s1"
-            session.messages = []
             await send_chat(db, "帮我生成一个前端开发岗的模拟面试", None)
+            turn = await begin_chat(db, "帮我生成一个前端开发岗的模拟面试", None)
         generate.assert_not_awaited()
         answer.assert_not_awaited()
         perceive.assert_not_awaited()
-        extras = [call.kwargs["extra"] for call in message_cls.call_args_list if "extra" in call.kwargs]
-        self.assertEqual(extras[-1]["kind"], "redirect")
+        message_cls.assert_not_called()
+        self.assertEqual(db.commits, 0)
+        self.assertIsNone(turn["user_message"])
+
+    async def test_model_detected_interview_redirect_is_not_saved_to_history(self) -> None:
+        db = _Db()
+        decision = {"intent": "generate_interview", "needs_recall": False, "todos": [], "actions": ["finish"]}
+        with (
+            patch("app.services.session.get_session", return_value=None),
+            patch("app.services.session.latest_question_set_for_session", return_value=None),
+            patch("app.services.session.ChatSession") as session_cls,
+            patch("app.services.session.ChatMessage") as message_cls,
+            patch("app.services.session.resolve_intent", new=AsyncMock(return_value=decision)),
+            patch("app.services.session.generate_and_store", new=AsyncMock()) as generate,
+            patch("app.services.session.complete", new=AsyncMock()) as answer,
+            patch("app.services.session.session_title", new=AsyncMock()) as title,
+            patch("app.services.session.now", return_value=None),
+        ):
+            session = session_cls.return_value
+            session.id = "s1"
+            session.messages = []
+            turn = await begin_chat(db, "岗位职责与任职要求足够长", None)
+            self.assertEqual(turn["mode"], "redirect")
+            reply, extra = await complete_chat_turn(db, turn)
+            self.assertEqual(extra["kind"], "redirect")
+            completed = await finish_chat(db, turn, reply, extra)
+        generate.assert_not_awaited()
+        answer.assert_not_awaited()
+        self.assertEqual(message_cls.call_count, 1)
+        self.assertEqual(len(db.deleted), 1)
+        self.assertEqual(db.commits, 2)
+        title.assert_not_awaited()
+        self.assertEqual(completed, session)
+        self.assertEqual([message.id for message in session.messages], ["redirect"])
 
     async def test_clarification_choice_is_decided_again(self) -> None:
         """Picking an option does not skip the model and force a question pack."""

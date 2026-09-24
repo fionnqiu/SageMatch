@@ -3,6 +3,19 @@ import { useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, Sparkles, Upload } from "lucide-react";
 import { api, type Interview } from "../../api";
 
+const dimensionLabels: Record<string, string> = {
+  technical_ability: "技术能力",
+  problem_analysis: "问题分析",
+  solution_tradeoffs: "方案权衡",
+  communication: "表达沟通",
+};
+
+function scoreBand(score: number) {
+  if (score >= 80) return "达到建议线";
+  if (score >= 65) return "接近建议线";
+  return "尚未达到建议线";
+}
+
 export function InterviewReportPage() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -30,6 +43,7 @@ export function InterviewReportPage() {
   }, [id]);
 
   const report = interview?.report;
+  const score = report?.score ?? 0;
   const when = interview?.ended_at || interview?.created_at;
   const whenLabel = when ? new Date(when).toISOString().slice(0, 16).replace("T", " ") : "";
 
@@ -45,13 +59,12 @@ export function InterviewReportPage() {
             {whenLabel ? ` (${whenLabel})` : ""}
           </div>
         </div>
-        <button
-          onClick={() => id && api.downloadReport(id)}
-          className="flex items-center gap-1.5 rounded-lg border border-line-strong bg-row px-4 py-2 text-xs"
-        >
-          <Upload size={14} className="text-mute" />
-          导出复盘报告 ↗
-        </button>
+        <div className="flex items-center gap-2">
+          <button onClick={() => id && api.downloadReport(id)} className="flex items-center gap-1.5 rounded-lg border border-line-strong bg-row px-4 py-2 text-xs">
+            <Upload size={14} className="text-mute" />
+            导出复盘报告 ↗
+          </button>
+        </div>
       </header>
 
       <div className="min-h-0 flex-1 space-y-[18px] overflow-y-auto px-8 py-[22px]">
@@ -60,20 +73,46 @@ export function InterviewReportPage() {
           返回模拟面试
         </button>
 
-        <div className="flex items-center justify-between rounded-[14px] border border-forest-2/40 bg-card-live px-[26px] py-[22px]">
-          <div className="flex items-center gap-5">
+        <div className="flex flex-wrap items-center justify-between gap-5 rounded-[14px] border border-forest-2/40 bg-card-live px-[26px] py-[22px]">
+          <div className="flex flex-wrap items-center gap-5">
             <div>
               <div className="text-[11px] text-mint-3">综合总评分</div>
-              <div className="font-mono text-[44px] leading-none text-mint-2">{(report?.score ?? 0).toFixed(1)}</div>
+              <div className="font-mono text-[44px] leading-none text-mint-2">{score.toFixed(1)}</div>
             </div>
-            <div className="text-[11px] text-dim">录用建议线 (≥80)</div>
-          </div>
-          <div className="flex w-[340px] justify-end">
-            <div className="rounded-lg border border-forest-2/40 bg-forest/15 px-3 py-2 text-[11px] text-mint-3">
-              已结合岗位技术深度与真实面试表现完成综合评定
+            <div className="space-y-1 text-[11px] text-dim">
+              <div>{!report ? "等待评分" : report.scoring_status === "unavailable" ? "评分服务不可用" : report.scoring_status === "invalid" ? "评分结果无效" : report.scoring_status === "legacy" ? "历史综合评分" : scoreBand(score)}</div>
+              <div>建议线 ≥80 · 四项各 25 分</div>
             </div>
           </div>
         </div>
+
+        <section className="space-y-3 rounded-[14px] border border-line bg-card p-[22px]">
+          <div className="text-sm font-semibold">分项评分与回答依据</div>
+          {report?.scoring_status === "valid" && report.dimensions ? (
+            <div className="divide-y divide-line">
+              {Object.entries(report.dimensions).map(([key, dimension]) => (
+                <div key={key} className="grid gap-2 py-3 first:pt-0 last:pb-0 sm:grid-cols-[130px_62px_minmax(0,1fr)] sm:items-start">
+                  <div className="text-[13px] font-medium text-ink">{dimensionLabels[key] || key}</div>
+                  <div className="font-mono text-[13px] text-mint">{dimension.score.toFixed(1)} / 25</div>
+                  <div className="space-y-1.5 text-xs leading-5">
+                    <div className="text-dim">依据：{dimension.evidence}</div>
+                    <div className="text-mint-3">建议：{dimension.advice}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs leading-5 text-dim">
+              {!report
+                ? "分项评分将在复盘完成后显示。"
+                : report.scoring_status === "unavailable"
+                  ? "评分模型当前不可用，本次报告没有有效分数。修复模型配置后重新评估。"
+                  : report.scoring_status === "invalid"
+                    ? "本次评分未通过完整性校验，报告中的 0 分仅表示评分失败。"
+                    : "此报告生成于分项评分启用之前，仅包含历史综合评分。"}
+            </p>
+          )}
+        </section>
 
         <div className="rounded-[14px] border border-line bg-card p-[22px]">
           <div className="mb-3 text-sm font-semibold">面试综合表现点评</div>

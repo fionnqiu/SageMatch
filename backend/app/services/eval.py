@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session, selectinload
 from app import knowledge
 from app.models import EvalRun, Interview
 from app.services.common import audit, new_id
-from app.services.interview import get_interview, write_report
+from app.services.interview import SCORE_DIMENSIONS, get_interview, score_band, write_report
 from app.services.recall import recall_snippets
 from app.services.session import generate_question_pack
 
@@ -61,18 +61,27 @@ async def run_score_eval(db: Session, interview_id: str | None, repeats: int = 5
         raise ValueError("没有已结束的面试可供评分评测")
     transcript = [{"role": t.role, "content": t.content} for t in interview.turns]
     scores: list[float] = []
+    dimension_scores: dict[str, list[float]] = {key: [] for key in SCORE_DIMENSIONS}
     for _ in range(max(2, min(repeats, 5))):
         recap = await write_report(db, interview.title, transcript)
-        scores.append(float(recap.get("score") or 80))
+        scores.append(float(recap.get("score") if recap.get("score") is not None else 0))
+        raw_dimensions = recap.get("dimensions") or {}
+        for key in SCORE_DIMENSIONS:
+            value = raw_dimensions.get(key)
+            dimension_scores[key].append(float(value.get("score", 0)) if isinstance(value, dict) else 0.0)
     sigma = statistics.pstdev(scores) if len(scores) > 1 else 0.0
-    order = list(scores)
-    stable = 1.0 if sorted(order) == sorted(scores) else 0.9
+    dimension_sigma = {key: round(statistics.pstdev(values), 3) for key, values in dimension_scores.items()}
+    # Consistency passes only when the total and every fixed dimension stay within two points.
+    stable = 1.0 if sigma <= 2 and all(value <= 2 for value in dimension_sigma.values()) else 0.0
     metrics = {
         "n": len(scores),
         "scores": scores,
         "sigma": round(sigma, 3),
         "kendall_tau": round(stable, 3),
         "mean": round(sum(scores) / len(scores), 2),
+        "dimension_scores": dimension_scores,
+        "dimension_sigma": dimension_sigma,
+        "band_consistency": round(sum(score_band(value) == score_band(scores[0]) for value in scores) / len(scores), 3),
     }
     run = EvalRun(
         id=new_id(),

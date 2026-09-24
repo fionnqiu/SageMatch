@@ -63,9 +63,9 @@ PROFILES: dict[str, AgentProfile] = {
         mission="基于候选人原话追问。在线只能引用历史原话，不查知识库。",
         autonomous=True,
         tool_scope=("get_turn_quote", "finish"),
-        max_steps=2,
+        max_steps=1,
         temperature=0.5,
-        max_tokens=400,
+        max_tokens=240,
         fallback_role="analyst",
     ),
     "scorer": AgentProfile(

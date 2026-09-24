@@ -10,6 +10,7 @@ from app.schemas.interview import (
     InterviewOut,
     InterviewTurnOut,
     QuestionOut,
+    ReportDimension,
     ReportIssue,
     ReportOut,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "QuestionOut",
     "RecallHit",
     "RecallOut",
+    "ReportDimension",
     "ReportIssue",
     "ReportOut",
     "RoleBindingIn",

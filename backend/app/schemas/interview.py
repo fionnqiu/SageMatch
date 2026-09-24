@@ -31,11 +31,19 @@ class ReportIssue(BaseModel):
     advice: str
 
 
+class ReportDimension(BaseModel):
+    score: float
+    evidence: str
+    advice: str
+
+
 class ReportOut(BaseModel):
     id: str
     score: float
     review: str
     issues: list[ReportIssue]
+    dimensions: dict[str, ReportDimension] | None = None
+    scoring_status: Literal["valid", "unavailable", "invalid", "legacy"] = "legacy"
     created_at: datetime
 
 

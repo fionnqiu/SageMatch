@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 # 用户已经点名要一场面试。回答模型无权再解释成「不能出题」。
@@ -35,9 +36,14 @@ from app.services.recall import recall_snippets
 
 
 def list_sessions(db: Session) -> list[ChatSession]:
-    # Empty drafts stay off history until the first user/assistant turn lands.
+    # 空草稿不进历史。创建面试写的内部会话也不进历史。
     has_turns = exists().where(ChatMessage.session_id == ChatSession.id)
-    return db.query(ChatSession).filter(has_turns).order_by(ChatSession.updated_at.desc()).all()
+    return (
+        db.query(ChatSession)
+        .filter(has_turns, ChatSession.origin != "interview")
+        .order_by(ChatSession.updated_at.desc())
+        .all()
+    )
 
 
 def get_session(db: Session, session_id: str) -> ChatSession | None:
@@ -165,7 +171,22 @@ async def begin_chat(
         db.flush()
         created = True
 
+    # Explicit interview creation is a navigation action, not a conversational turn.
+    if _asks_for_interview(content):
+        return {
+            "session": session,
+            "content": content,
+            "intent": {"intent": "answer", "needs_recall": False, "todos": [], "actions": ["redirect"], "source": "redirect"},
+            "first_turn": False,
+            "opening": "",
+            "mode": "redirect",
+            "prompt": None,
+            "extra": None,
+            "user_message": None,
+        }
+
     pending = _pending_clarification(session)
+    user_message = None
     # 标题只看第一条用户消息。澄清选项和后续追问不再改历史里的名字。
     first_turn = not any(message.role == "user" for message in (session.messages or []))
     opening = ""
@@ -173,30 +194,28 @@ async def begin_chat(
         content = _apply_clarification(pending, answers)
         if first_turn:
             opening = content
-        db.add(
-            ChatMessage(
-                id=new_id(),
-                session_id=session.id,
-                role="user",
-                content=_answers_text(pending, answers),
-                extra={"kind": "clarification_reply", "answers": answers},
-            )
+        user_message = ChatMessage(
+            id=new_id(),
+            session_id=session.id,
+            role="user",
+            content=_answers_text(pending, answers),
+            extra={"kind": "clarification_reply", "answers": answers},
         )
+        db.add(user_message)
     else:
         # 气泡只留用户自己写的字和文件名。抽出的正文放进模型上下文，不回写到 content。
         visible, model_content, files = _compose_turn(content, attachments or [])
         content = model_content
         if first_turn:
             opening = visible or "、".join(item["name"] for item in files)
-        db.add(
-            ChatMessage(
-                id=new_id(),
-                session_id=session.id,
-                role="user",
-                content=visible,
-                extra={"kind": "attachment", "files": files} if files else None,
-            )
+        user_message = ChatMessage(
+            id=new_id(),
+            session_id=session.id,
+            role="user",
+            content=visible,
+            extra={"kind": "attachment", "files": files} if files else None,
         )
+        db.add(user_message)
     # 用户这句话先落库。后面的模型流可以中断，刷新后仍能看到自己发过什么。
     session_id_saved = session.id
     db.commit()
@@ -219,6 +238,7 @@ async def begin_chat(
             "mode": "redirect",
             "prompt": None,
             "extra": None,
+            "user_message": user_message,
         }
     # 选项只是把方向补进这句话。无论有没有选项，这一轮都由感知代理决定。
     intent = await resolve_intent(
@@ -252,6 +272,7 @@ async def begin_chat(
         "mode": mode,
         "prompt": prompt,
         "extra": extra,
+        "user_message": user_message if mode == "redirect" else None,
     }
 
 
@@ -264,6 +285,8 @@ async def chat_stream_mode(
 ) -> str:
     """判断这一轮能不能逐块输出。不写消息，避免不能流时把同一句话落两次。"""
     session = get_session(db, session_id) if session_id else None
+    if _asks_for_interview(content):
+        return "redirect"
     pending = _pending_clarification(session)
     model_content = content
     if pending and answers:
@@ -317,6 +340,20 @@ async def complete_chat_turn(db: Session, turn: dict[str, Any]) -> tuple[str, di
 async def finish_chat(db: Session, turn: dict[str, Any], reply: str, extra: dict[str, Any]) -> ChatSession:
     """助手消息和标题都在正文收齐后写入。流式中途不落半句。"""
     session = turn["session"]
+    if turn["mode"] == "redirect":
+        # Remove only this transient navigation turn; older conversation stays intact.
+        discard_redirect_turn(db, turn)
+        # The API caller still needs a redirect marker, but it must never reach the database.
+        redirect_message = SimpleNamespace(
+            id="redirect",
+            session_id=session.id,
+            role="assistant",
+            content=reply,
+            extra=extra,
+            created_at=now(),
+        )
+        session.messages = [*(session.messages or []), redirect_message]
+        return session
     if turn["first_turn"] and turn["opening"]:
         # 标题仍是一次短调用。正文流结束后再起名，避免和回答抢同一轮输出。
         session.title = await session_title(db, turn["opening"])
@@ -332,6 +369,14 @@ async def finish_chat(db: Session, turn: dict[str, Any], reply: str, extra: dict
     )
     db.commit()
     return get_session(db, session.id)  # type: ignore[return-value]
+
+
+def discard_redirect_turn(db: Session, turn: dict[str, Any]) -> None:
+    """Discard the chat row staged before intent resolution selected interview navigation."""
+    user_message = turn.get("user_message")
+    if user_message is not None:
+        db.delete(user_message)
+        db.commit()
 
 
 def prepare_chat_file(filename: str, data: bytes) -> str:

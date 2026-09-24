@@ -51,7 +51,7 @@ export function InterviewHubPage() {
       navigate(`/interview/${item.id}/report`);
       return;
     }
-    if (item.status === "ready") {
+    if (item.status === "ready" || item.status === "abandoned") {
       try {
         const iv = await api.openInterview(item.id);
         navigate(`/interview/${iv.id}`);
@@ -135,7 +135,7 @@ export function InterviewHubPage() {
 
         <div className="grid min-h-0 grid-cols-3 gap-4">
           {rest.map((item) => {
-            const ready = item.status === "ready";
+            const ready = item.status === "ready" || item.status === "abandoned";
             const ended = item.status === "ended";
             return (
               <div
@@ -151,7 +151,7 @@ export function InterviewHubPage() {
                         ready ? "bg-forest text-mint-4" : "bg-chip text-mute"
                       }`}
                     >
-                      {ended ? "已完成" : ready ? "待开始" : item.status}
+                      {ended ? "已完成" : "待开始"}
                     </span>
                     <span className="flex items-center gap-2">
                       {item.score != null ? <span className="text-base font-bold">{item.score.toFixed(1)}</span> : null}

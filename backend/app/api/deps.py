@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app import schemas, services
+from app.services.interview import SCORE_DIMENSIONS
 from app.models import Interview, ProviderConfig
 
 
@@ -26,12 +27,34 @@ def interview_out(item: Interview) -> schemas.InterviewOut:
             score=item.report.score,
             review=item.report.review,
             issues=[schemas.ReportIssue.model_validate(i) for i in (item.report.issues or [])],
+        dimensions=(
+                {
+                    key: schemas.ReportDimension.model_validate(item.report.dimensions[key])
+                    for key in SCORE_DIMENSIONS
+                    if key in item.report.dimensions
+                }
+                if isinstance(item.report.dimensions, dict) and item.report.dimensions
+            else None
+        ),
+            scoring_status=item.report.scoring_status or (
+                "unavailable"
+                if isinstance(item.report.dimensions, dict)
+                and item.report.dimensions
+                and all("评分模型当前不可用" in value.get("evidence", "") for value in item.report.dimensions.values())
+                else "invalid"
+                if isinstance(item.report.dimensions, dict)
+                and item.report.dimensions
+                and all("模型未返回完整" in value.get("evidence", "") for value in item.report.dimensions.values())
+                else "valid"
+                if isinstance(item.report.dimensions, dict) and item.report.dimensions
+                else "legacy"
+            ),
             created_at=item.report.created_at,
         )
     return schemas.InterviewOut(
         id=item.id,
         title=item.title,
-        status=item.status,
+        status="ready" if item.status == "abandoned" else item.status,
         current_question_index=item.current_question_index,
         started_at=item.started_at,
         ended_at=item.ended_at,
@@ -124,6 +147,13 @@ def report_text(interview: Interview) -> str:
         "",
         "关键失分点",
     ]
+    if report and isinstance(report.dimensions, dict):
+        lines.extend(["", "分项评分"])
+        for key, label in SCORE_DIMENSIONS.items():
+            value = report.dimensions.get(key)
+            if not isinstance(value, dict):
+                continue
+            lines.extend([f"- {label}: {value.get('score', '-')}/25", f"  依据：{value.get('evidence', '')}", f"  建议：{value.get('advice', '')}"])
     for item in (report.issues if report else []) or []:
         lines.extend(["", f"- {item.get('issue')}", f"  {item.get('quote')}", f"  {item.get('advice')}"])
     return "\n".join(lines)

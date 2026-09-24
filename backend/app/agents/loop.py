@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.agents.contracts import AgentProfile, profile_for
 from app.agents.governance import ProviderGovernor, cache_get, cache_put
-from app.agents.tools import ToolSpec, tools_for
+from app.agents.tools import ToolSpec, tool_schemas_for, tools_for
 
 # One supervisor step plus one worker step. A veto-and-rewrite is a second call,
 # not a longer graph, so the old "one rewrite" rule still holds.
@@ -67,6 +67,11 @@ class _RoleModel(BaseChatModel):
 
     async def _complete(self, messages: list[Any]) -> AIMessage:
         tools = list(getattr(self, "_tools", []))
+        if self.role == "interviewer":
+            try:
+                return await self._interviewer_decision(messages)
+            except Exception:
+                return _offline_interviewer_message(messages)
         # The supervisor's handoff tools carry injected graph state. The JSON gateway cannot fill
         # those, so a transfer is returned as a bare tool call and LangGraph injects the state.
         if any(str(getattr(tool, "name", "")).startswith("transfer_to_") for tool in tools):
@@ -78,19 +83,44 @@ class _RoleModel(BaseChatModel):
             if not name:
                 return AIMessage(content=text)
             return AIMessage(content="", tool_calls=[{"name": name, "args": {}, "id": f"{self.role}-handoff"}])
-        # 没有思考监听时仍走整段 JSON。追问和打分不该因为出题页改成流式。
+        # 非流式角色优先使用标准 function calling；不支持时继续走旧 JSON action。
         if getattr(self, "_on_thought", None) is None:
             from app.services.llm_gateway import complete_with
 
-            data = await complete_with(
-                self._db(),
-                self.role,
-                "你是受契约约束的代理。只能调用列出的工具。不要解释。",
-                _decision_prompt(messages, tools),
-                max_tokens=self.max_tokens,
-                expect_json=True,
-                temperature=self.temperature,
-            )
+            schemas = tool_schemas_for(profile_for(self.role).tool_scope)
+            try:
+                data = await complete_with(
+                    self._db(),
+                    self.role,
+                    "你是受契约约束的代理。只能调用列出的工具。不要解释。",
+                    _decision_prompt(messages, tools),
+                    max_tokens=self.max_tokens,
+                    tools=schemas,
+                    temperature=self.temperature,
+                )
+            except Exception:
+                # Legacy endpoints reject tools with 400; retain the proven JSON protocol as a fallback.
+                data = await complete_with(
+                    self._db(),
+                    self.role,
+                    "你是受契约约束的代理。只能调用列出的工具。不要解释。",
+                    _decision_prompt(messages, tools),
+                    max_tokens=self.max_tokens,
+                    expect_json=True,
+                    temperature=self.temperature,
+                )
+            if data is None:
+                data = await complete_with(
+                    self._db(),
+                    self.role,
+                    "你是受契约约束的代理。只能调用列出的工具。不要解释。",
+                    _decision_prompt(messages, tools),
+                    max_tokens=self.max_tokens,
+                    expect_json=True,
+                    temperature=self.temperature,
+                )
+            if isinstance(data, dict) and "name" in data and "arguments" in data:
+                return AIMessage(content="", tool_calls=[{"name": data["name"], "args": data["arguments"], "id": data.get("id", f"{self.role}-call")}])
         else:
             raw = await self._speak(
                 messages,
@@ -110,12 +140,31 @@ class _RoleModel(BaseChatModel):
             return AIMessage(content="")
         name = str(data.get("tool") or "")
         args = data.get("arguments") if isinstance(data.get("arguments"), dict) else {}
+        if self.role == "interviewer" and name == "finish":
+            return AIMessage(content="", tool_calls=[{"name": "finish", "args": args, "id": f"{self.role}-call"}])
         if not name:
             return AIMessage(content=json.dumps(data, ensure_ascii=False))
         return AIMessage(
             content="",
             tool_calls=[{"name": name, "args": args, "id": f"{self.role}-call"}],
         )
+
+    async def _interviewer_decision(self, messages: list[Any]) -> AIMessage:
+        """Use one bounded text call for conversational follow-ups; tools stay available on explicit need."""
+        from app.services.llm_gateway import complete_with
+
+        text = str(await complete_with(
+            self._db(),
+            "interviewer",
+            "你是中文技术面试官。根据候选人刚才的回答提出一个简短、自然、可口头回答的追问。"
+            "不要评价或给分，不要重复原题。若已给出下一题，直接转到下一题。",
+            _latest_human(messages)[-1800:],
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+        ) or "").strip()
+        if text:
+            return AIMessage(content="", tool_calls=[{"name": "finish", "args": {"text": text}, "id": "interviewer-finish"}])
+        return _offline_interviewer_message(messages)
 
     async def _text(self, messages: list[Any], tools: list[Any]) -> str:
         catalog = "、".join(_tool_name(tool) for tool in tools)
@@ -214,6 +263,19 @@ def _latest_human(messages: list[Any]) -> str:
         if isinstance(message, dict) and message.get("role") == "user":
             return str(message.get("content") or "")
     return ""
+
+
+def _offline_interviewer_message(messages: list[Any]) -> AIMessage:
+    """Return a deterministic fallback prompt when the interviewer vendor times out."""
+    task = _latest_human(messages)
+    answer = task.split("候选人刚说：", 1)[-1].split("\n下一题：", 1)[0].strip()
+    next_question = task.split("下一题：", 1)[-1].strip() if "下一题：" in task else "无"
+    if next_question and next_question != "无":
+        text = f"你提到的做法是“{answer[:70]}”。接下来请回答：{next_question}"
+    else:
+        hints = ("为什么选择这个方案，还有什么替代方案？", "能补充关键步骤、数据或阈值吗？", "如果出现超时或部分失败，你会如何处理？")
+        text = f"你提到的做法是“{answer[:70]}”。{hints[sum(answer.encode('utf-8')) % len(hints)]}"
+    return AIMessage(content="", tool_calls=[{"name": "finish", "args": {"text": text}, "id": "interviewer-fallback"}])
 
 
 def _observations(messages: list[Any]) -> list[dict[str, Any]]:

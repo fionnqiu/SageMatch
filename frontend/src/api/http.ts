@@ -1,5 +1,16 @@
 /** Shared fetch helpers. Callers pass a path; JSON vs multipart is chosen here. */
 
+function responseError(text: string, statusText: string): Error {
+  try {
+    const parsed = JSON.parse(text) as { detail?: unknown };
+    if (typeof parsed.detail === "string" && parsed.detail) return new Error(parsed.detail);
+  } catch {
+    // Proxies and unhandled server errors can return plain text instead of the API JSON shape.
+  }
+  if (/^internal server error$/i.test(text.trim())) return new Error("服务器内部错误，请稍后重试");
+  return new Error(text || statusText);
+}
+
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
@@ -7,13 +18,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const text = await res.text();
-    try {
-      const parsed = JSON.parse(text) as { detail?: string };
-      throw new Error(parsed.detail || text || res.statusText);
-    } catch (err) {
-      if (err instanceof Error && err.message !== text) throw err;
-      throw new Error(text || res.statusText);
-    }
+    throw responseError(text, res.statusText);
   }
   if (res.status === 204) return undefined as T;
   const ctype = res.headers.get("content-type") || "";
@@ -30,13 +35,7 @@ export async function sendFile<T>(path: string, file: File, extra?: Record<strin
   const res = await fetch(path, { method: "POST", body });
   if (!res.ok) {
     const text = await res.text();
-    try {
-      const parsed = JSON.parse(text) as { detail?: string };
-      throw new Error(parsed.detail || text || res.statusText);
-    } catch (err) {
-      if (err instanceof Error && err.message !== text) throw err;
-      throw new Error(text || res.statusText);
-    }
+    throw responseError(text, res.statusText);
   }
   return res.json() as Promise<T>;
 }
@@ -56,13 +55,7 @@ export async function readEventStream(
   });
   if (!res.ok || !res.body) {
     const text = await res.text();
-    try {
-      const parsed = JSON.parse(text) as { detail?: string };
-      throw new Error(parsed.detail || text || res.statusText);
-    } catch (err) {
-      if (err instanceof Error && err.message !== text) throw err;
-      throw new Error(text || res.statusText);
-    }
+    throw responseError(text, res.statusText);
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();

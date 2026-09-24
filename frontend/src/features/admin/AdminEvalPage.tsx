@@ -62,7 +62,7 @@ export function AdminEvalPage() {
         </section>
         <section className="space-y-2 rounded-xl border border-line bg-card p-4">
           <h2 className="text-[13px] font-semibold">评分一致性评测</h2>
-          <p className="text-[11px] text-dim">对最近一场已结束面试重复评分 N=5，输出 σ。</p>
+          <p className="text-[11px] text-dim">对最近一场已结束面试重复评分 N=5，查看总分与四项维度的波动 σ。</p>
           <button
             onClick={async () => {
               setBusy("s");

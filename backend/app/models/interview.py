@@ -61,6 +61,7 @@ class Interview(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     elapsed_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    followups_on_question: Mapped[int] = mapped_column(Integer, default=0)
     tags: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -90,7 +91,7 @@ class InterviewTurn(Base):
 
 
 class Report(Base):
-    """Overall score plus written recap. No per-dimension scores on the UI."""
+    """Overall score and evidence-backed dimension breakdown for one interview."""
 
     __tablename__ = "reports"
 
@@ -99,6 +100,8 @@ class Report(Base):
     score: Mapped[float] = mapped_column(Float)
     review: Mapped[str] = mapped_column(Text)
     issues: Mapped[list] = mapped_column(JSONB, default=lambda: [])
+    dimensions: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    scoring_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     interview: Mapped[Interview] = relationship(back_populates="report")

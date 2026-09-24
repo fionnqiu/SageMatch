@@ -7,6 +7,7 @@ from typing import Any
 
 from app import llm
 from app.api.session import _sse
+from app.agents.tools import tool_schemas_for
 from app.services.providers import _chat_protocol
 
 
@@ -61,7 +62,67 @@ class _Client:
         return None
 
 
+class _JsonResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return self.payload
+
+
+class _JsonClient:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.calls: list[dict[str, Any]] = []
+
+    async def __aenter__(self) -> "_JsonClient":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def post(self, url: str, **kwargs: Any) -> _JsonResponse:
+        self.calls.append({"url": url, **kwargs})
+        return _JsonResponse(self.payload)
+
+
 class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
+    def test_role_tool_schema_is_allow_listed_and_strict(self) -> None:
+        schemas = tool_schemas_for(("validate_question", "missing"))
+        self.assertEqual([item["function"]["name"] for item in schemas], ["validate_question"])
+        parameters = schemas[0]["function"]["parameters"]
+        self.assertEqual(parameters["required"], ["stem"])
+        self.assertFalse(parameters["additionalProperties"])
+
+    async def test_complete_tool_call_sends_standard_tools(self) -> None:
+        original = llm.httpx.AsyncClient
+        json_client = _JsonClient({
+            "choices": [{"message": {"tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "finish", "arguments": '{"ok":true}'},
+            }]}}]
+        })
+        llm.httpx.AsyncClient = lambda **_kwargs: json_client  # type: ignore[assignment]
+        try:
+            result = await llm.complete_tool_call(
+                "系统", "用户", tools=[{
+                    "type": "function",
+                    "function": {"name": "finish", "description": "结束", "parameters": {"type": "object"}},
+                }], api_key="key", base_url="https://example.test/v1", model="qwen",
+            )
+        finally:
+            llm.httpx.AsyncClient = original  # type: ignore[assignment]
+
+        self.assertEqual(result, {"id": "call-1", "name": "finish", "arguments": {"ok": True}})
+        body = json_client.calls[0]["json"]
+        self.assertEqual(body["tools"][0]["function"]["name"], "finish")
+        self.assertEqual(body["tool_choice"], "auto")
+        self.assertFalse(body["stream"])
+
     async def test_chat_always_streams_with_thinking(self) -> None:
         response = _StreamResponse(
             [

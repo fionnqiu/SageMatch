@@ -82,8 +82,12 @@ async def chat_stream(payload: schemas.ChatSendIn, db: Session = Depends(get_db)
         # 这里不写消息。前端收到 blocked 后改走 /api/chat，由整段接口落库。
         return StreamingResponse(_blocked_events(), media_type="text/event-stream", headers=_stream_headers())
     turn = await services.begin_chat(db, payload.content, payload.session_id, answers or None, attachments or None)
+    if turn["mode"] == "redirect":
+        # Intent can change after the request was staged; remove that transient user row.
+        services.discard_redirect_turn(db, turn)
+        return StreamingResponse(_redirect_events(), media_type="text/event-stream", headers=_stream_headers())
     if turn["mode"] not in {"answer", "followup"}:
-        # 意图在两次判断之间变了。消息已落库，不能再重放整段接口。
+        # 澄清流不支持增量正文，沿用整段收尾。
         return StreamingResponse(_fallback_events(db, turn), media_type="text/event-stream", headers=_stream_headers())
     return StreamingResponse(_answer_events(db, turn), media_type="text/event-stream", headers=_stream_headers())
 

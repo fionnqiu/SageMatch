@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -15,6 +16,7 @@ from app.api.deps import interview_detail, interview_out, report_text
 from app.db import SessionLocal, get_db
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _stream_headers() -> dict[str, str]:
@@ -130,6 +132,13 @@ async def answer_interview(
         interview = await services.answer_interview(db, interview_id, payload.content, payload.answer_mode)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        # Answer persistence and response serialization share one request. Roll back
+        # any failed transaction so the pooled connection remains usable, then expose
+        # a retryable status instead of leaking an unhandled 500 to the candidate.
+        db.rollback()
+        logger.exception("failed to submit interview answer: interview_id=%s", interview_id)
+        raise HTTPException(503, "回答暂时未提交，请稍后重试") from exc
     return interview_detail(interview)
 
 
@@ -149,7 +158,7 @@ async def end_interview(interview_id: str, db: Session = Depends(get_db)) -> sch
 
 @router.post("/api/interviews/{interview_id}/abandon", response_model=schemas.InterviewDetail)
 def abandon_interview(interview_id: str, db: Session = Depends(get_db)) -> schemas.InterviewDetail:
-    """直接退出。不排队写复盘。"""
+    """Direct exit returns the attempt to ready; no recap job is queued."""
     try:
         interview = services.abandon_interview(db, interview_id)
     except ValueError as exc:

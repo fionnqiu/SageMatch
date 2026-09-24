@@ -23,6 +23,8 @@ export type Report = {
   score: number;
   review: string;
   issues: { issue: string; quote: string; advice: string }[];
+  dimensions?: Record<string, { score: number; evidence: string; advice: string }> | null;
+  scoring_status?: "valid" | "unavailable" | "invalid" | "legacy";
   created_at: string;
 };
 
@@ -59,13 +61,14 @@ export const interviewApi = {
       body: JSON.stringify({ session_id: sessionId }),
     }),
   openInterview: (id: string) => request<Interview>(`/api/interviews/${id}/start`, { method: "POST" }),
-  answerInterview: (id: string, content: string, answerMode: "text" | "voice" = "text") =>
+  answerInterview: (id: string, content: string, answerMode: "text" | "voice" = "text", signal?: AbortSignal) =>
     request<Interview>(`/api/interviews/${id}/answer`, {
       method: "POST",
       body: JSON.stringify({ content, answer_mode: answerMode }),
+      signal,
     }),
   endInterview: (id: string) => request<Interview>(`/api/interviews/${id}/end`, { method: "POST" }),
-  // 直接退出。后端停表并结束场次，不排队写复盘。
+  // 直接退出回到待开始，不生成复盘；后端会清理半场进度。
   abandonInterview: (id: string) => request<Interview>(`/api/interviews/${id}/abandon`, { method: "POST" }),
   deleteInterview: (id: string) => request<{ ok: string }>(`/api/interviews/${id}`, { method: "DELETE" }),
   downloadReport: (id: string) => {

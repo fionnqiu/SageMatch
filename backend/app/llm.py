@@ -49,6 +49,59 @@ async def complete_json(
     return _extract_json(raw)
 
 
+async def complete_tool_call(
+    system: str,
+    user: str,
+    *,
+    tools: list[dict[str, Any]],
+    max_tokens: int = 900,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    temperature: float = 0.4,
+    top_p: float | None = None,
+) -> dict[str, Any] | None:
+    """Call the OpenAI tool protocol and normalize its first function call."""
+    settings = get_settings()
+    gen = get_rag_config().generation
+    key = api_key if api_key is not None else settings.llm_api_key
+    url = base_url if base_url is not None else settings.llm_base_url
+    mdl = model or settings.llm_model
+    nucleus = gen.top_p if top_p is None else top_p
+    if not key:
+        raise RuntimeError("LLM_API_KEY is empty")
+    body: dict[str, Any] = {
+        "model": mdl,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "enable_thinking": False,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "tools": tools,
+        "tool_choice": "auto",
+    }
+    if 0 < nucleus <= 1:
+        body["top_p"] = nucleus
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    timeout = httpx.Timeout(180.0, connect=15.0, read=60.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        res = await client.post(f"{openai_root(url)}/chat/completions", headers=headers, json=body)
+        res.raise_for_status()
+        data = res.json()
+    choices = data.get("choices") if isinstance(data, dict) else None
+    message = choices[0].get("message") if choices else None
+    calls = message.get("tool_calls") if isinstance(message, dict) else None
+    call = calls[0] if calls else None
+    function = call.get("function") if isinstance(call, dict) else None
+    if not isinstance(function, dict) or not function.get("name"):
+        return None
+    raw_args = function.get("arguments") or "{}"
+    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+    if not isinstance(args, dict):
+        raise ValueError("tool arguments must be a JSON object")
+    return {"id": str(call.get("id") or "tool-call"), "name": str(function["name"]), "arguments": args}
+
+
 async def complete_text(
     system: str,
     user: str,

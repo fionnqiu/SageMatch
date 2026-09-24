@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.agents.contracts import profile_for
-from app.agents.loop import run_agent, run_team
+from app.agents.loop import run_agent
 from app.agents.memory import MemoryManager
 
 
@@ -24,21 +24,21 @@ async def author_questions(
     context = memory.render()
     if hits:
         context += "\n\n[预取知识]\n" + "\n".join(str(hit.get("text") or "")[:200] for hit in hits[:4])
-    # The supervisor picks author, then critic. One veto comes back as a second team run.
+    # This business sequence is fixed: author, critic, then at most one rewrite.
     objection = ""
-    result: dict[str, Any] = {}
+    result: dict[str, Any] = {"ok": False, "output": {}, "steps": 0, "observations": []}
     verdict = {"pass": True, "reason": ""}
     for attempt in range(2):
-        result = await run_team(
+        result = await run_agent(
             db,
-            ("author", "critic"),
+            profile_for("author"),
             user=_author_task(job_text, objection),
             context=context,
             seed={"hits": hits or []},
             on_thought=on_thought,
         )
         output = result.get("output") or {}
-        if not output.get("questions"):
+        if not result.get("ok") or not output.get("questions"):
             break
         verdict = await _critic_verdict(db, output, on_thought=on_thought)
         if verdict["pass"] or attempt == 1:
@@ -72,23 +72,21 @@ async def interviewer_followup(
 ) -> str:
     """One bounded interviewer loop. The only tool besides finish is quoting a past turn."""
     memory = MemoryManager(db, interview_id=interview_id)
-    result = await run_agent(
-        db,
-        profile_for("interviewer"),
-        user=(
-            "给出一段追问，不要评分。finish.arguments 只包含 text。"
-            f"\n当前题：{question_stem}\n候选人刚说：{answer}\n下一题：{next_stem or '无'}"
-        ),
-        context=memory.render(turns=_as_turns(turns)),
-        seed={"turns": turns},
-    )
-    text = str((result.get("output") or {}).get("text") or "").strip()
-    if text:
-        slots = memory.episode().get("slots") or {}
-        index = int(slots.get("question_index") or 0)
-        followups = int(slots.get("followups_on_question") or 0) + 1
-        memory.advance_interview_slot(question_index=index, quote=answer, followups_on_question=followups)
-    return text
+    try:
+        result = await run_agent(
+            db,
+            profile_for("interviewer"),
+            user=(
+                "给出一段简短自然的口头追问，不要评分。finish.arguments 只包含 text。"
+                f"\n当前题：{question_stem}\n候选人刚说：{answer}\n下一题：{next_stem or '无'}"
+            ),
+            context=memory.render(turns=_as_turns(turns)),
+            seed={"turns": turns},
+        )
+        return str((result.get("output") or {}).get("text") or "").strip()
+    except Exception:
+        # Interview pacing and answer persistence must not depend on provider uptime.
+        return f"你提到的做法是“{answer[:80]}”。{_followup_hint(answer)}"
 
 
 def review_pack(raw: dict[str, Any]) -> dict[str, Any]:
@@ -144,3 +142,10 @@ def _as_turns(turns: list[dict[str, str]]) -> list[Any]:
             self.content = content
 
     return [_Turn(str(item.get("role") or ""), str(item.get("content") or "")) for item in turns]
+
+
+def _followup_hint(answer: str) -> str:
+    """Choose a deterministic probe from the answer when interviewer generation fails."""
+    hints = ("为什么选择这个方案，还有什么替代方案？", "能补充关键步骤、数据或阈值吗？", "如果出现超时或部分失败，你会如何处理？")
+    marker = sum(answer.encode("utf-8")) % len(hints)
+    return hints[marker]

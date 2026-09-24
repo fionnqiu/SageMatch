@@ -18,13 +18,30 @@ Handler = Callable[[Session, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 @dataclass(frozen=True)
 class ToolSpec:
-    """JSON-schema-ish contract checked before the handler runs."""
+    """Tool contract shared by local validation and provider function calling."""
 
     name: str
     description: str
     required: tuple[str, ...]
     cache_ttl: float
     handler: Handler
+    properties: dict[str, dict[str, Any]] | None = None
+
+    def schema(self) -> dict[str, Any]:
+        """Return the OpenAI function schema from the same contract used locally."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": self.properties or {key: {"type": "string"} for key in self.required},
+                    "required": list(self.required),
+                    "additionalProperties": False,
+                },
+            },
+        }
 
 
 async def hybrid_search(db: Session, args: dict[str, Any]) -> dict[str, Any]:
@@ -41,10 +58,7 @@ async def hybrid_search(db: Session, args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def validate_question(db: Session, args: dict[str, Any]) -> dict[str, Any]:
-    """Deterministic checks only. Semantic quality stays with the critic role.
-
-    A live interview is spoken. A choice question, or any leftover options, is rejected.
-    """
+    """Deterministic checks only. Semantic quality stays with the critic role."""
     del db
     stem = str(args.get("stem") or "").strip()
     kind = str(args.get("kind") or "open").strip()
@@ -94,22 +108,28 @@ async def get_turn_quote(db: Session, args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def finish_tool(db: Session, args: dict[str, Any]) -> dict[str, Any]:
-    """Stop the loop. The payload is the role's decision, already schema-checked by the caller."""
+    """Stop the loop. The payload is the role's decision."""
     del db
     return {"success": True, "final": True, "payload": args}
 
 
 TOOLS: dict[str, ToolSpec] = {
-    "hybrid_search": ToolSpec("hybrid_search", "按查询检索知识片段", ("query",), 120.0, hybrid_search),
-    "validate_question": ToolSpec("validate_question", "检查题干和选项是否齐", ("stem",), 0.0, validate_question),
-    "check_duplicate": ToolSpec("check_duplicate", "计算题干之间的重复率", ("stems",), 0.0, check_duplicate),
-    "get_turn_quote": ToolSpec("get_turn_quote", "引用候选人说过的原话", (), 0.0, get_turn_quote),
-    "finish": ToolSpec("finish", "结束循环并提交决定", (), 0.0, finish_tool),
+    "hybrid_search": ToolSpec("hybrid_search", "按查询检索知识片段", ("query",), 120.0, hybrid_search, {"query": {"type": "string"}}),
+    "validate_question": ToolSpec("validate_question", "检查题干和选项是否齐", ("stem",), 0.0, validate_question, {"stem": {"type": "string"}, "kind": {"type": "string", "enum": ["open", "scenario"]}, "options": {"type": "array", "items": {"type": "string"}}}),
+    "check_duplicate": ToolSpec("check_duplicate", "计算题干之间的重复率", ("stems",), 0.0, check_duplicate, {"stems": {"type": "array", "items": {"type": "string"}}}),
+    "get_turn_quote": ToolSpec("get_turn_quote", "引用候选人说过的原话", (), 0.0, get_turn_quote, {"turns": {"type": "array", "items": {"type": "object"}}, "query": {"type": "string"}}),
+    # finish intentionally allows role-specific payload keys; LangGraph still enforces the role allow-list.
+    "finish": ToolSpec("finish", "结束循环并提交决定", (), 0.0, finish_tool, {"text": {"type": "string"}, "questions": {"type": "array", "items": {"type": "object"}}}),
 }
 
 
 def tools_for(scope: tuple[str, ...]) -> dict[str, ToolSpec]:
     return {name: TOOLS[name] for name in scope if name in TOOLS}
+
+
+def tool_schemas_for(scope: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Expose only the role's allow-listed schemas to a model provider."""
+    return [spec.schema() for spec in tools_for(scope).values()]
 
 
 def _shingles(text: str) -> set[str]:

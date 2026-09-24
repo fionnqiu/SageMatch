@@ -13,7 +13,77 @@ from app.agents.memory import MemoryManager
 from app.agents.router import choose_provider
 from app.agents.tools import check_duplicate, validate_question
 from app.services.intent import resolve_intent
-from app.services.interview import write_report
+from app.services.interview import SCORE_DIMENSIONS, _frozen_score, score_band, write_report
+
+
+class ScoreEval(unittest.IsolatedAsyncioTestCase):
+    async def test_repeated_scoring_tracks_each_dimension_sigma(self) -> None:
+        from app.services.eval import run_score_eval
+
+        class Query:
+            def options(self, *_args):
+                return self
+
+            def filter(self, *_args):
+                return self
+
+            def order_by(self, *_args):
+                return self
+
+            def first(self):
+                return interview
+
+            def one_or_none(self):
+                return interview
+
+        class Run:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        interview = SimpleNamespace(
+            id="iv-1",
+            title="后端",
+            turns=[SimpleNamespace(role="user", content="解释方案")],
+        )
+        dimensions = {
+            key: {"score": (10 if index == 0 else 20), "evidence": "证据", "advice": "建议"}
+            for index, key in enumerate(SCORE_DIMENSIONS)
+        }
+        added = []
+        db = SimpleNamespace(
+            query=lambda _model: Query(),
+            add=added.append,
+            commit=lambda: None,
+            refresh=lambda _run: None,
+        )
+        with patch("app.services.eval.EvalRun", Run), patch("app.services.eval.audit"), patch("app.services.eval.write_report", new_callable=AsyncMock, side_effect=[
+            {"score": 70, "dimensions": dimensions},
+            {"score": 74, "dimensions": {**dimensions, "technical_ability": {**dimensions["technical_ability"], "score": 14}}},
+        ]):
+            run = await run_score_eval(db, "iv-1", repeats=2)
+
+        self.assertEqual(added[0].metrics["sigma"], 2.0)
+        self.assertEqual(added[0].metrics["dimension_sigma"]["technical_ability"], 2.0)
+        self.assertEqual(added[0].metrics["dimension_sigma"]["problem_analysis"], 0.0)
+        self.assertEqual(added[0].metrics["kendall_tau"], 1.0)
+        self.assertEqual(added[0].metrics["band_consistency"], 1.0)
+
+        varied = {**dimensions, "technical_ability": {**dimensions["technical_ability"], "score": 20}}
+        with patch("app.services.eval.EvalRun", Run), patch("app.services.eval.audit"), patch("app.services.eval.write_report", new_callable=AsyncMock, side_effect=[
+            {"score": 70, "dimensions": dimensions},
+            {"score": 70, "dimensions": varied},
+        ]):
+            await run_score_eval(db, "iv-1", repeats=2)
+        self.assertEqual(added[1].metrics["sigma"], 0.0)
+        self.assertGreater(added[1].metrics["dimension_sigma"]["technical_ability"], 2)
+        self.assertEqual(added[1].metrics["kendall_tau"], 0.0)
+
+        with patch("app.services.eval.EvalRun", Run), patch("app.services.eval.audit"), patch("app.services.eval.write_report", new_callable=AsyncMock, side_effect=[
+            {"score": 64, "dimensions": dimensions},
+            {"score": 80, "dimensions": dimensions},
+        ]):
+            await run_score_eval(db, "iv-1", repeats=2)
+        self.assertEqual(added[2].metrics["band_consistency"], 0.5)
 
 
 class _Row:
@@ -86,7 +156,8 @@ class Contracts(unittest.TestCase):
         profile = profile_for("interviewer")
         self.assertIn("get_turn_quote", profile.tool_scope)
         self.assertNotIn("hybrid_search", profile.tool_scope)
-        self.assertLessEqual(profile.max_steps, 2)
+        self.assertEqual(profile.max_steps, 1)
+        self.assertEqual(profile.max_tokens, 240)
 
     def test_author_budget_is_three_steps(self) -> None:
         profile = profile_for("author")
@@ -141,25 +212,24 @@ class ToolLoop(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_tool_is_rejected_then_finish_works(self) -> None:
         model = AsyncMock(
             side_effect=[
-                {"tool": "hybrid_search", "arguments": {"query": "缓存"}},
-                {"tool": "finish", "arguments": {"text": "请给出具体阈值。"}},
+                "请给出具体阈值。",
             ]
         )
         with patch("app.services.llm_gateway.complete_with", new=model):
             result = await run_agent(_Db(), profile_for("interviewer"), user="追问", seed={"turns": []})
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"]["text"], "请给出具体阈值。")
-        self.assertFalse(result["observations"][0]["ok"])
-        self.assertEqual(result["observations"][0]["tool"], "hybrid_search")
+        self.assertEqual(result["observations"][0]["tool"], "finish")
 
     async def test_loop_stops_at_the_contract_budget(self) -> None:
-        model = AsyncMock(return_value={"tool": "get_turn_quote", "arguments": {}})
+        model = AsyncMock(return_value="先说明你选择方案的依据。")
         with patch("app.services.llm_gateway.complete_with", new=model):
             result = await run_agent(
                 _Db(), profile_for("interviewer"), user="追问", seed={"turns": [{"role": "user", "content": "加了锁"}]}
             )
-        self.assertFalse(result["ok"])
-        self.assertLessEqual(model.await_count, 2)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output"]["text"], "先说明你选择方案的依据。")
+        self.assertEqual(model.await_count, 1)
 
 
 class Routing(unittest.TestCase):
@@ -230,47 +300,39 @@ class CriticGate(unittest.IsolatedAsyncioTestCase):
             "questions": [_question("缓存击穿时为什么用互斥锁"), _question("看门狗为什么要续期")],
         }
 
+        calls: list[str] = []
+
         async def fake_run(_db, profile, **_kwargs):
-            # run_team receives the role pair. The critic call is still one role.
-            role = profile if isinstance(profile, str) else getattr(profile, "role", "")
+            role = profile.role
+            calls.append(role)
             if role == "critic":
                 return {"ok": True, "output": {"pass": False, "reason": "题干重复", "questions": [_question("被改写的题")]}}
-            if fake_run.calls:
-                return {"ok": True, "output": accepted}
-            fake_run.calls += 1
-            return {"ok": True, "output": rejected}
+            return {"ok": True, "output": rejected if calls.count("author") == 1 else accepted, "steps": 1, "observations": []}
 
-        fake_run.calls = 0
-        with patch("app.agents.authoring.run_team", new=fake_run), patch(
-            "app.agents.authoring.run_agent", new=fake_run
-        ), patch(
+        with patch("app.agents.authoring.run_agent", new=fake_run), patch(
             "app.agents.authoring.MemoryManager", return_value=SimpleNamespace(render=lambda **_k: "", remember_profile=lambda *_a, **_k: None, update_episode=lambda **_k: None)
         ):
             result = await author_questions(object(), "后端岗位")
         self.assertEqual(result["questions"], accepted["questions"])
         self.assertEqual(result["_agent"]["verdict"], "rejected")
-        self.assertEqual(fake_run.calls, 1)
+        self.assertEqual(result["_agent"]["reason"], "题干重复")
+        self.assertEqual(calls, ["author", "critic", "author", "critic"])
 
     async def test_second_rejection_does_not_trigger_a_third_author_pass(self) -> None:
         async def fake_run(_db, profile, **_kwargs):
-            # A team call passes the role tuple. A critic call passes one profile.
-            if isinstance(profile, tuple):
-                fake_run.roles.extend(profile)
-                return {"ok": True, "output": {"questions": [_question("缓存击穿时为什么用互斥锁")]}}
-            role = getattr(profile, "role", "")
+            role = profile.role
             fake_run.roles.append(role)
+            if role == "author":
+                return {"ok": True, "output": {"questions": [_question("缓存击穿时为什么用互斥锁")]}, "steps": 1, "observations": []}
             return {"ok": True, "output": {"pass": False, "reason": "缺解析"}}
 
         fake_run.roles = []
-        with patch("app.agents.authoring.run_team", new=fake_run), patch(
-            "app.agents.authoring.run_agent", new=fake_run
-        ), patch(
+        with patch("app.agents.authoring.run_agent", new=fake_run), patch(
             "app.agents.authoring.MemoryManager", return_value=SimpleNamespace(render=lambda **_k: "", remember_profile=lambda *_a, **_k: None, update_episode=lambda **_k: None)
         ):
             await author_questions(object(), "后端岗位")
-        # The team hands both roles to the supervisor. The critic is asked once per attempt.
-        # Two team runs, and the critic is asked once after each. No third author pass.
-        self.assertEqual(fake_run.roles, ["author", "critic", "critic", "author", "critic", "critic"])
+        # The explicit workflow performs two author attempts, each followed by one critic verdict.
+        self.assertEqual(fake_run.roles, ["author", "critic", "author", "critic"])
 
     def test_critic_payload_cannot_carry_questions(self) -> None:
         verdict = review_pack({"pass": False, "reason": "题干重复", "questions": [_question("替换题")]})
@@ -279,21 +341,84 @@ class CriticGate(unittest.IsolatedAsyncioTestCase):
 
 
 class ScoreFreeze(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _dimensions(score: float = 20) -> dict:
+        return {
+            key: {"score": score, "evidence": "候选人说明了处理步骤。", "advice": "补充边界条件。"}
+            for key in SCORE_DIMENSIONS
+        }
+
     async def test_coach_prose_cannot_replace_the_frozen_score(self) -> None:
-        """Scorer owns the number. A different score in the recap is ignored."""
+        """The code sums scorer dimensions, and coach prose cannot replace that total."""
 
         async def fake_complete(_db, role, _system, _user, **_kwargs):
             if role == "scorer":
-                return {"score": 71}
+                return {"dimensions": self._dimensions()}
             if role == "coach":
                 return {"score": 99, "review": "表述清楚，但缺少阈值。", "summary": "达到进一步", "issues": []}
             raise AssertionError(role)
 
         with patch("app.services.interview.complete", new=fake_complete), patch("app.llm.llm_available", return_value=True):
             report = await write_report(object(), "后端场次", [{"role": "user", "content": "加了锁"}])
-        self.assertEqual(report["score"], 71)
+        self.assertEqual(report["score"], 80)
+        self.assertEqual(set(report["dimensions"]), set(SCORE_DIMENSIONS))
         self.assertEqual(report["review"], "表述清楚，但缺少阈值。")
+        self.assertEqual(report["scoring_status"], "valid")
         self.assertNotIn("score", report["_coach"])
+
+    async def test_coach_failure_does_not_mark_a_valid_score_invalid(self) -> None:
+        async def scorer_then_fail_coach(_db, role, _system, _user, **_kwargs):
+            if role == "scorer":
+                return {"dimensions": self._dimensions()}
+            raise TimeoutError("coach timed out")
+
+        with patch("app.services.interview.complete", new=scorer_then_fail_coach), patch("app.llm.llm_available", return_value=True):
+            report = await write_report(object(), "后端场次", [{"role": "user", "content": "加了锁"}])
+        self.assertEqual(report["score"], 80)
+        self.assertEqual(report["scoring_status"], "valid")
+        self.assertEqual(report["review"], "评分已完成，复盘文字暂未生成，请稍后重新查看。")
+
+    async def test_dimension_scores_must_be_complete_and_in_range(self) -> None:
+        async def missing(_db, _role, _system, _user, **_kwargs):
+            return {"dimensions": {"technical_ability": {"score": 26, "evidence": "x", "advice": "y"}}}
+
+        with patch("app.services.interview.complete", new=missing):
+            with self.assertRaisesRegex(ValueError, "incomplete dimensions"):
+                await _frozen_score(object(), "后端场次", [{"role": "user", "content": "加了锁"}])
+
+        async def out_of_range(_db, _role, _system, _user, **_kwargs):
+            dimensions = self._dimensions()
+            dimensions["technical_ability"]["score"] = 26
+            return {"dimensions": dimensions}
+
+        with patch("app.services.interview.complete", new=out_of_range):
+            with self.assertRaisesRegex(ValueError, "invalid score or evidence"):
+                await _frozen_score(object(), "后端场次", [{"role": "user", "content": "加了锁"}])
+
+    async def test_invalid_score_falls_back_to_unscored_report(self) -> None:
+        async def fail(_db, _role, _system, _user, **_kwargs):
+            raise ValueError("bad model response")
+
+        with patch("app.services.interview.complete", new=fail), patch("app.llm.llm_available", return_value=True):
+            report = await write_report(object(), "后端场次", [{"role": "user", "content": "加了锁"}])
+        self.assertEqual(report["score"], 0)
+        self.assertIn("有效面试评估", report["summary"])
+
+    async def test_unanswered_dimensions_are_zero_and_never_reach_hiring_line(self) -> None:
+        async def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("empty interviews must not ask the model for a score")
+
+        transcript = [{"role": "interviewer", "content": "请介绍一下你的项目。"}]
+        with patch("app.services.interview.complete", new=fail_if_called), patch("app.llm.llm_available", return_value=True):
+            report = await write_report(object(), "空场次", transcript)
+        self.assertLessEqual(report["score"], 20)
+        self.assertIn("未作答", report["summary"])
+        self.assertTrue(all(item["score"] == 0 for item in report["dimensions"].values()))
+
+    def test_score_bands_keep_the_existing_recommendation_line(self) -> None:
+        self.assertEqual(score_band(80), "达到建议线")
+        self.assertEqual(score_band(65), "接近建议线")
+        self.assertEqual(score_band(64.9), "尚未达到建议线")
 
 
 class IntentFusion(unittest.IsolatedAsyncioTestCase):

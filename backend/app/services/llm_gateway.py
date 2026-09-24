@@ -49,8 +49,9 @@ async def complete_with(
     max_tokens: int | None = None,
     expect_json: bool = False,
     temperature: float | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> Any:
-    """Public entry used by the tool loop. Temperature falls back to the role contract."""
+    """Route one call; standard tool calls are optional so legacy providers still work."""
     choice = choose_provider(db, role)
     provider, binding = choice.provider, choice.binding
     # An open breaker already redirected choose_provider. Record against the vendor we actually call.
@@ -74,6 +75,23 @@ async def complete_with(
         raise RuntimeError(f"供应商 {provider.name} 熔断中")
     started = time.perf_counter()
     try:
+        if tools:
+            # Providers receive a real function schema; callers still get the internal normalized shape.
+            data = await llm.complete_tool_call(
+                system,
+                user,
+                tools=tools,
+                max_tokens=token_budget,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                temperature=temp,
+                top_p=gen.top_p,
+            )
+            ms = int((time.perf_counter() - started) * 1000)
+            log_call(db, choice.role, provider.name if provider else "env", model, "ok", ms, None)
+            governor.record_success(ms)
+            return data
         if expect_json:
             data = await llm.complete_json(
                 system,

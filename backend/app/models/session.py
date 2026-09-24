@@ -17,6 +17,8 @@ class ChatSession(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     title: Mapped[str] = mapped_column(String(200), default="新会话")
     job_title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # chat 是历史对话。interview 是创建面试时的内部会话，不进历史列表。
+    origin: Mapped[str] = mapped_column(String(20), default="chat")
     user_id: Mapped[str] = mapped_column(String(64), default="local-user")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
