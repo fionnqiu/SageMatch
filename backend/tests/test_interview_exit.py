@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from app.services.interview import abandon_interview, finish_interview, resume_or_start
+from app.api.interview import regenerate_interview_report
+from app.services.interview import abandon_interview, build_report, finish_interview, regenerate_report, resume_or_start
 
 
 class _Interview:
@@ -24,6 +26,28 @@ class _Interview:
 
 
 class InterviewExitTests(unittest.IsolatedAsyncioTestCase):
+    def test_regenerate_report_route_is_async_for_queue_scheduling(self) -> None:
+        """The report queue needs the event loop owned by an async FastAPI route."""
+        self.assertTrue(inspect.iscoroutinefunction(regenerate_interview_report))
+
+    def test_regenerate_report_removes_old_report_and_resets_summary(self) -> None:
+        """The temporary test action must replace the old report and keep the transcript."""
+        interview = _Interview()
+        interview.status = "ended"
+        interview.summary = "旧复盘"
+        old_report = SimpleNamespace(id="report-1")
+        interview.report = old_report
+        deleted: list[object] = []
+        db = SimpleNamespace(delete=deleted.append, flush=lambda: None, commit=lambda: None)
+
+        with patch("app.services.interview.get_interview", side_effect=[interview, interview]):
+            result = regenerate_report(db, "iv-1")
+
+        self.assertEqual(deleted, [old_report])
+        self.assertIsNone(result.report)
+        self.assertEqual(result.summary, "正在重新生成复盘")
+        self.assertEqual(result.turns[0].content, "加了锁")
+
     async def test_finish_stops_the_clock_before_the_report_exists(self) -> None:
         interview = _Interview()
         saved: dict[str, object] = {}
@@ -103,9 +127,19 @@ class InterviewExitTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.services.interview.write_report", new=slow_report), patch(
             "app.services.interview._store_report"
         ) as store:
-            from app.services.interview import build_report
-
             await build_report(object(), "iv-1", "后端", [{"role": "user", "content": "加了锁"}])
 
         started.assert_awaited()
         store.assert_called_once()
+
+    async def test_report_job_converts_model_failure_to_a_saved_fallback(self) -> None:
+        """A worker failure must finish with a readable report, not endless polling."""
+        fallback = {"score": 0.0, "review": "复盘服务暂时不可用，已保存保底结果。", "summary": "复盘生成失败，已使用保底结果。", "issues": [], "scoring_status": "unavailable"}
+
+        db = object()
+        with patch("app.services.interview.write_report", new=AsyncMock(side_effect=RuntimeError("provider down"))), patch(
+            "app.services.interview.generation_failed_report", return_value=fallback
+        ), patch("app.services.interview._store_report") as store:
+            await build_report(db, "iv-1", "后端", [{"role": "user", "content": "加了锁"}])
+
+        store.assert_called_once_with(db, "iv-1", fallback)

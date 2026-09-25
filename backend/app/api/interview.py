@@ -166,6 +166,18 @@ def abandon_interview(interview_id: str, db: Session = Depends(get_db)) -> schem
     return interview_detail(interview)
 
 
+@router.post("/api/interviews/{interview_id}/report/regenerate", response_model=schemas.InterviewDetail)
+async def regenerate_interview_report(interview_id: str, db: Session = Depends(get_db)) -> schemas.InterviewDetail:
+    """Temporary QA action: replace the current report and enqueue a fresh run."""
+    try:
+        interview = services.regenerate_report(db, interview_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    transcript = [{"role": turn.role, "content": turn.content} for turn in interview.turns]
+    services.schedule_report(interview.id, interview.title, transcript)
+    return interview_detail(interview)
+
+
 @router.delete("/api/interviews/{interview_id}")
 def delete_interview(interview_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
     try:

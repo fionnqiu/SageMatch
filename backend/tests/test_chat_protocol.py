@@ -63,8 +63,9 @@ class _Client:
 
 
 class _JsonResponse:
-    def __init__(self, payload: dict[str, Any]) -> None:
+    def __init__(self, payload: dict[str, Any], status_code: int = 200) -> None:
         self.payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
         return None
@@ -85,11 +86,130 @@ class _JsonClient:
         return None
 
     async def post(self, url: str, **kwargs: Any) -> _JsonResponse:
-        self.calls.append({"url": url, **kwargs})
+        snapshot = {"url": url, **kwargs}
+        if isinstance(snapshot.get("json"), dict):
+            snapshot["json"] = dict(snapshot["json"])
+        self.calls.append(snapshot)
         return _JsonResponse(self.payload)
 
 
+class _JsonSequenceClient:
+    """Return deterministic non-streaming responses for retry-path tests."""
+
+    def __init__(self, payloads: list[dict[str, Any]], statuses: list[int] | None = None) -> None:
+        self.payloads = payloads
+        self.statuses = statuses or [200] * len(payloads)
+        self.calls: list[dict[str, Any]] = []
+
+    async def __aenter__(self) -> "_JsonSequenceClient":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def post(self, url: str, **kwargs: Any) -> _JsonResponse:
+        snapshot = {"url": url, **kwargs}
+        if isinstance(snapshot.get("json"), dict):
+            snapshot["json"] = dict(snapshot["json"])
+        self.calls.append(snapshot)
+        return _JsonResponse(self.payloads.pop(0), self.statuses.pop(0))
+
+
 class ChatProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_complete_json_uses_non_streaming_json_request_without_thinking(self) -> None:
+        """Structured grading must not spend its output budget on streamed reasoning."""
+        client = _JsonClient({"choices": [{"message": {"content": '{"review":"ok"}'}}]})
+        original = llm.httpx.AsyncClient
+        llm.httpx.AsyncClient = lambda **_kwargs: client  # type: ignore[assignment]
+        try:
+            result = await llm.complete_json(
+                "系统",
+                "返回 review JSON",
+                api_key="key",
+                base_url="https://example.test/v1",
+                model="qwen",
+            )
+        finally:
+            llm.httpx.AsyncClient = original  # type: ignore[assignment]
+
+        self.assertEqual(result, {"review": "ok"})
+        body = client.calls[0]["json"]
+        self.assertFalse(body["stream"])
+        self.assertFalse(body["enable_thinking"])
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+
+    async def test_complete_json_retries_once_after_malformed_output(self) -> None:
+        """A transient delimiter error gets one strict low-temperature retry."""
+        client = _JsonSequenceClient(
+            [
+                {"choices": [{"message": {"content": '{"review":"truncated'}}]},
+                {"choices": [{"message": {"content": '{"review":"complete"}'}}]},
+            ]
+        )
+        original = llm.httpx.AsyncClient
+        llm.httpx.AsyncClient = lambda **_kwargs: client  # type: ignore[assignment]
+        try:
+            result = await llm.complete_json(
+                "系统",
+                "返回 review JSON",
+                api_key="key",
+                base_url="https://example.test/v1",
+                model="qwen",
+            )
+        finally:
+            llm.httpx.AsyncClient = original  # type: ignore[assignment]
+
+        self.assertEqual(result, {"review": "complete"})
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[1]["json"]["temperature"], 0.0)
+        self.assertNotIn("response_format", client.calls[1]["json"])
+
+    async def test_complete_json_retries_when_provider_returns_no_content(self) -> None:
+        """A length-truncated empty response must use the same bounded retry."""
+        client = _JsonSequenceClient(
+            [
+                {"choices": [{"finish_reason": "length", "message": {"content": ""}}]},
+                {"choices": [{"finish_reason": "stop", "message": {"content": '{"review":"ok"}'}}]},
+            ]
+        )
+        original = llm.httpx.AsyncClient
+        llm.httpx.AsyncClient = lambda **_kwargs: client  # type: ignore[assignment]
+        try:
+            result = await llm.complete_json(
+                "系统",
+                "返回 review JSON",
+                api_key="key",
+                base_url="https://example.test/v1",
+                model="qwen",
+            )
+        finally:
+            llm.httpx.AsyncClient = original  # type: ignore[assignment]
+
+        self.assertEqual(result, {"review": "ok"})
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[1]["json"]["temperature"], 0.0)
+
+    async def test_complete_json_drops_unsupported_response_format(self) -> None:
+        """Compatible endpoints may reject response_format while accepting JSON prompts."""
+        payload = {"choices": [{"message": {"content": '{"review":"ok"}'}}]}
+        client = _JsonSequenceClient([payload, payload], statuses=[400, 200])
+        original = llm.httpx.AsyncClient
+        llm.httpx.AsyncClient = lambda **_kwargs: client  # type: ignore[assignment]
+        try:
+            result = await llm.complete_json(
+                "系统",
+                "返回 review JSON",
+                api_key="key",
+                base_url="https://example.test/v1",
+                model="qwen",
+            )
+        finally:
+            llm.httpx.AsyncClient = original  # type: ignore[assignment]
+
+        self.assertEqual(result, {"review": "ok"})
+        self.assertIn("response_format", client.calls[0]["json"])
+        self.assertNotIn("response_format", client.calls[1]["json"])
+
     def test_role_tool_schema_is_allow_listed_and_strict(self) -> None:
         schemas = tool_schemas_for(("validate_question", "missing"))
         self.assertEqual([item["function"]["name"] for item in schemas], ["validate_question"])

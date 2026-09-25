@@ -319,6 +319,23 @@ async def finish_interview(db: Session, interview_id: str) -> Interview:
     return get_interview(db, interview.id)  # type: ignore[return-value]
 
 
+def regenerate_report(db: Session, interview_id: str) -> Interview:
+    """Clear one ended report so the temporary test action can enqueue it again."""
+    interview = get_interview(db, interview_id)
+    if not interview:
+        raise ValueError("面试不存在")
+    if interview.status != "ended":
+        raise ValueError("只有已结束的面试可以重新生成复盘")
+    if interview.report is not None:
+        # The transcript is intentionally retained; only the derived report is replaced.
+        db.delete(interview.report)
+        interview.report = None
+        db.flush()
+    interview.summary = "正在重新生成复盘"
+    db.commit()
+    return get_interview(db, interview.id)  # type: ignore[return-value]
+
+
 async def end_interview(db: Session, interview_id: str) -> Interview:
     """兼容旧调用：停表后就在这条连接里写完复盘。页面改走 finish。"""
     interview = await finish_interview(db, interview_id)
@@ -333,7 +350,12 @@ async def build_report(
     db: Session, interview_id: str, title: str, transcript: list[dict[str, str]]
 ) -> None:
     """后台补复盘。请求上的会话已经关掉，这里用自己的会话。"""
-    recap = await write_report(db, title, transcript)
+    try:
+        recap = await write_report(db, title, transcript)
+    except Exception:
+        # The worker must always terminate with a persisted report. Otherwise the
+        # UI keeps polling an ended interview forever after a provider or parser failure.
+        recap = generation_failed_report()
     _store_report(db, interview_id, recap)
 
 
@@ -361,8 +383,9 @@ async def _run_report_queue() -> None:
         try:
             await build_report(own, interview_id, title, transcript)
         except Exception:
-            # 单场失败不能停掉工人，否则后面排队的复盘都写不出来。
-            pass
+            # A database failure must not stop later jobs. The normal model failure
+            # path is handled inside build_report so it can still save a fallback.
+            own.rollback()
         finally:
             own.close()
             _report_queue.task_done()
@@ -492,39 +515,57 @@ def unanswered_report() -> dict[str, Any]:
 
 
 async def write_report(db: Session, title: str, transcript: list[dict[str, str]]) -> dict[str, Any]:
-    """Freeze a score, then explain it. Eval repeats the same two-step path."""
+    """Freeze a score, then produce a required, parseable coaching result."""
     # 没答题时模型会照抄提示里的高分样例。这里直接封顶，避免空场次进入录用区间。
     if not candidate_answers(transcript):
         return unanswered_report()
     if not llm.llm_available():
         return unavailable_report()
     try:
-        # The scorer returns dimension evidence; code owns the bounded total calculation.
         dimensions = await _frozen_score(db, title, transcript)
-        score = round(sum(value["score"] for value in dimensions.values()), 1)
-        system = "你是复盘教练。分数已经冻结，不要改分，也不要输出分数。指出具体问题和可执行建议。"
-        user = (
-            f"场次：{title}\n已冻结总分：{score}\n维度评分及依据：{dimensions}\n对话：{transcript}\n"
-            '返回 JSON：{"review": "...", "summary": "...", '
-            '"issues": [{"issue":"...","quote":"...","advice":"..."}]}'
-        )
-        try:
-            prose = await complete(db, "coach", system, user, max_tokens=1200, expect_json=True)
-        except Exception:
-            # Scoring is already valid; a coach timeout must not invalidate the frozen dimensions.
-            prose = {"review": "评分已完成，复盘文字暂未生成，请稍后重新查看。", "summary": "分项评分已完成。", "issues": []}
-        coach = {key: value for key, value in prose.items() if key != "score"}
+    except Exception:
+        return invalid_report()
+
+    score = round(sum(value["score"] for value in dimensions.values()), 1)
+    system = "你是复盘教练。分数已经冻结，不要改分，也不要输出分数。指出具体问题和可执行建议。"
+    user = (
+        f"场次：{title}\n已冻结总分：{score}\n维度评分及依据：{dimensions}\n对话：{transcript}\n"
+        '返回 JSON：{"review": "...", "summary": "...", '
+        '"issues": [{"issue":"...","quote":"...","advice":"..."}]}'
+    )
+    try:
+        prose = await complete(db, "coach", system, user, max_tokens=1600, expect_json=True)
+        if not isinstance(prose, dict):
+            raise ValueError("coach returned a non-object response")
+        if not isinstance(prose.get("review"), str) or not prose["review"].strip():
+            raise ValueError("coach returned incomplete review")
+        if not isinstance(prose.get("summary"), str) or not prose["summary"].strip():
+            raise ValueError("coach returned incomplete summary")
+        if not isinstance(prose.get("issues"), list):
+            raise ValueError("coach returned invalid issues")
+    except Exception:
+        # Coaching is explanatory text, not the score authority. Preserve the
+        # validated dimensions and give the candidate a truthful local review.
+        coach = local_coach_fallback(dimensions)
         return {
             "score": score,
             "dimensions": dimensions,
-            "review": coach.get("review") or "",
-            "summary": coach.get("summary") or "",
-            "issues": coach.get("issues") or [],
+            "review": coach["review"],
+            "summary": coach["summary"],
+            "issues": coach["issues"],
             "scoring_status": "valid",
             "_coach": coach,
         }
-    except Exception:
-        return invalid_report()
+    coach = {key: value for key, value in prose.items() if key != "score"}
+    return {
+        "score": score,
+        "dimensions": dimensions,
+        "review": coach.get("review") or "",
+        "summary": coach.get("summary") or "",
+        "issues": coach.get("issues") or [],
+        "scoring_status": "valid",
+        "_coach": coach,
+    }
 
 
 async def _frozen_score(db: Session, title: str, transcript: list[dict[str, str]]) -> dict[str, dict[str, Any]]:
@@ -547,7 +588,9 @@ async def _frozen_score(db: Session, title: str, transcript: list[dict[str, str]
             '"solution_tradeoffs":{"score":0,"evidence":"缺少候选人证据","advice":"..."},'
             '"communication":{"score":0,"evidence":"缺少候选人证据","advice":"..."}}}'
         ),
-        max_tokens=800,
+        # Four dimensions each need evidence and advice; 800 tokens frequently
+        # truncates the closing braces, which is the main parse failure in logs.
+        max_tokens=1600,
         expect_json=True,
         temperature=0.0,
     )
@@ -582,6 +625,39 @@ def unavailable_report() -> dict[str, Any]:
         "review": "评分服务当前不可用，本报告不代表候选人的真实能力表现。请检查模型配置后重新评估。",
         "issues": [],
         "scoring_status": "unavailable",
+    }
+
+
+def generation_failed_report() -> dict[str, Any]:
+    """Persist a clearly labelled report when the whole generation path crashes."""
+    return {
+        "score": 0.0,
+        "dimensions": {
+            key: {
+                "score": 0.0,
+                "evidence": "复盘生成失败，未形成可验证的评分证据。",
+                "advice": "检查模型配置后重新评估本场面试。",
+            }
+            for key in SCORE_DIMENSIONS
+        },
+        "summary": "复盘生成失败，已保存保底结果。",
+        "review": "复盘服务暂时不可用，已保存保底结果；本报告不代表候选人的真实能力表现。",
+        "issues": [],
+        "scoring_status": "unavailable",
+    }
+
+
+def local_coach_fallback(dimensions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Explain a valid score without another provider call.
+
+    This keeps the score evidence useful when only the prose coach fails.
+    """
+    weak = [SCORE_DIMENSIONS[key] for key, item in dimensions.items() if float(item.get("score", 0)) < 15]
+    focus = "、".join(weak) if weak else "边界条件和取舍"
+    return {
+        "review": f"分项评分已完成，但复盘文字暂未生成。建议下一次重点补充：{focus}。",
+        "summary": "分项评分已完成，复盘文字使用本地保底提示。",
+        "issues": [],
     }
 
 

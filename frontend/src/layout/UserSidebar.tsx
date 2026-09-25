@@ -44,8 +44,11 @@ export function UserSidebar({
         </button>
         <NavLink
           to="/interview"
-          className={`flex h-8 w-8 items-center justify-center rounded-md transition-[background-color,color,transform] duration-150 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-forest-2/60 ${
-            interviewActive ? "bg-forest/20 text-mint hover:bg-forest/30" : "text-mute hover:bg-field hover:text-ink"
+          aria-current={interviewActive ? "page" : undefined}
+          className={`flex h-8 w-8 items-center justify-center rounded-md border transition-[background-color,border-color,color,transform] duration-150 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-forest-2/60 ${
+            interviewActive
+              ? "border-line-strong bg-field text-ink hover:border-line-strong hover:bg-elevated"
+              : "border-transparent text-mute hover:border-line-strong hover:bg-field hover:text-ink"
           }`}
           aria-label="模拟面试"
         >
@@ -84,10 +87,11 @@ export function UserSidebar({
         <nav className="flex flex-col gap-1">
           <NavLink
             to="/interview"
-            className={`flex h-9 items-center gap-2.5 rounded-md px-3 text-xs transition-[background-color,border-color,color,transform] duration-150 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-forest-2/60 ${
+            aria-current={interviewActive ? "page" : undefined}
+            className={`flex h-9 items-center gap-2.5 rounded-md border px-3 text-xs transition-[background-color,border-color,color,transform] duration-150 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-forest-2/60 ${
               interviewActive
-                ? "border border-forest-2/50 bg-forest/20 font-semibold text-ink hover:bg-forest/30"
-                : "text-mute hover:bg-field hover:text-ink"
+                ? "border-line-strong bg-field font-semibold text-ink hover:border-line-strong hover:bg-elevated"
+                : "border-transparent text-mute hover:border-line-strong hover:bg-field hover:text-ink"
             }`}
           >
             <Mic size={15} className={interviewActive ? "text-mint" : "text-dim"} />
@@ -105,7 +109,7 @@ export function UserSidebar({
                 /* Hover 属于整行，删除按钮单独保留自己的 focus/active 状态。 */
                 className={`group flex w-full items-center gap-1 rounded-lg border border-transparent pr-1 text-xs transition-[background-color,border-color,color] duration-150 ${
                   active
-                    ? "border-forest-2/40 bg-field font-medium text-ink hover:bg-elevated"
+                    ? "border-line-strong bg-field font-medium text-ink hover:border-line-strong hover:bg-elevated"
                     : "text-mute hover:border-line-strong/70 hover:bg-row hover:text-ink"
                 }`}
               >

@@ -70,12 +70,13 @@ PROFILES: dict[str, AgentProfile] = {
     ),
     "scorer": AgentProfile(
         role="scorer",
-        mission="只给整体分。不写给用户看的复盘。",
+        mission="给技术能力、问题分析、方案权衡、表达沟通四项分数，并为每项提供证据和建议。不写给用户看的复盘。",
         autonomous=False,
         tool_scope=(),
         max_steps=1,
         temperature=0.0,
-        max_tokens=400,
+        # Four dimensions each carry evidence and advice; 400 tokens truncates the JSON object.
+        max_tokens=1600,
     ),
     "coach": AgentProfile(
         role="coach",

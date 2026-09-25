@@ -167,6 +167,12 @@ class Contracts(unittest.TestCase):
         self.assertGreaterEqual(profile.max_tokens, 3600)
         self.assertIn("hybrid_search", profile.tool_scope)
 
+    def test_scorer_contract_matches_evidence_dimensions(self) -> None:
+        """The default scorer contract must leave room for four evidence objects."""
+        profile = profile_for("scorer")
+        self.assertIn("四项", profile.mission)
+        self.assertGreaterEqual(profile.max_tokens, 1600)
+
 
 class ToolRules(unittest.IsolatedAsyncioTestCase):
     async def test_validate_and_duplicate_are_deterministic(self) -> None:
@@ -366,7 +372,7 @@ class ScoreFreeze(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["scoring_status"], "valid")
         self.assertNotIn("score", report["_coach"])
 
-    async def test_coach_failure_does_not_mark_a_valid_score_invalid(self) -> None:
+    async def test_coach_failure_keeps_frozen_score_and_uses_local_review(self) -> None:
         async def scorer_then_fail_coach(_db, role, _system, _user, **_kwargs):
             if role == "scorer":
                 return {"dimensions": self._dimensions()}
@@ -374,9 +380,24 @@ class ScoreFreeze(unittest.IsolatedAsyncioTestCase):
 
         with patch("app.services.interview.complete", new=scorer_then_fail_coach), patch("app.llm.llm_available", return_value=True):
             report = await write_report(object(), "后端场次", [{"role": "user", "content": "加了锁"}])
+        # The scorer already produced four valid dimensions. A coach outage must
+        # not erase that evidence or turn a valid score into a misleading zero.
         self.assertEqual(report["score"], 80)
         self.assertEqual(report["scoring_status"], "valid")
-        self.assertEqual(report["review"], "评分已完成，复盘文字暂未生成，请稍后重新查看。")
+        self.assertIn("复盘文字暂未生成", report["review"])
+        self.assertEqual(report["issues"], [])
+
+    async def test_coach_payload_must_contain_parseable_review_fields(self) -> None:
+        async def scorer_then_incomplete_coach(_db, role, _system, _user, **_kwargs):
+            if role == "scorer":
+                return {"dimensions": self._dimensions()}
+            return {"review": "", "summary": "", "issues": "not-a-list"}
+
+        with patch("app.services.interview.complete", new=scorer_then_incomplete_coach), patch("app.llm.llm_available", return_value=True):
+            report = await write_report(object(), "后端场次", [{"role": "user", "content": "加了锁"}])
+        self.assertEqual(report["scoring_status"], "valid")
+        self.assertIn("复盘文字暂未生成", report["review"])
+        self.assertEqual(report["score"], 80)
 
     async def test_dimension_scores_must_be_complete_and_in_range(self) -> None:
         async def missing(_db, _role, _system, _user, **_kwargs):
@@ -403,6 +424,7 @@ class ScoreFreeze(unittest.IsolatedAsyncioTestCase):
             report = await write_report(object(), "后端场次", [{"role": "user", "content": "加了锁"}])
         self.assertEqual(report["score"], 0)
         self.assertIn("有效面试评估", report["summary"])
+        self.assertEqual(report["scoring_status"], "invalid")
 
     async def test_unanswered_dimensions_are_zero_and_never_reach_hiring_line(self) -> None:
         async def fail_if_called(*_args, **_kwargs):

@@ -25,8 +25,7 @@ export function AdminRecallPage() {
   return (
     <div className="flex h-full flex-col bg-shell">
       <header className="flex h-12 items-center justify-between border-b border-line px-6 text-xs">
-        <span className="text-ink-2">召回调试 · 查看真实命中片段与排序</span>
-        <span className="text-dim">top-k / top-p / temperature / 分块参数后续由后端 config 提供，本页不配置</span>
+        <span className="font-medium text-ink-2">召回调试</span>
       </header>
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-8 py-5">
         <section className="space-y-2.5 rounded-xl border border-line bg-card p-4">

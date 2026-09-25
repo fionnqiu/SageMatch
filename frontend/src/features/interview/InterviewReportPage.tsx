@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, Sparkles, Upload } from "lucide-react";
+import { ArrowLeft, RefreshCw, Sparkles, Upload } from "lucide-react";
 import { api, type Interview } from "../../api";
 
 const dimensionLabels: Record<string, string> = {
@@ -20,6 +20,9 @@ export function InterviewReportPage() {
   const { id } = useParams();
   const navigate = useNavigate();
   const [interview, setInterview] = useState<Interview | null>(null);
+  const [reloadToken, setReloadToken] = useState(0);
+  const [regenerating, setRegenerating] = useState(false);
+  const [regenerateError, setRegenerateError] = useState("");
 
   useEffect(() => {
     if (!id) return;
@@ -40,7 +43,24 @@ export function InterviewReportPage() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [id]);
+  }, [id, reloadToken]);
+
+  async function regenerate() {
+    if (!id || regenerating) return;
+    setRegenerating(true);
+    setRegenerateError("");
+    try {
+      const next = await api.regenerateReport(id);
+      setInterview(next);
+      // The response intentionally has no report. Restart the existing polling
+      // effect so the page observes the newly queued result.
+      setReloadToken((value) => value + 1);
+    } catch (error) {
+      setRegenerateError(error instanceof Error ? error.message : "重新生成复盘失败");
+    } finally {
+      setRegenerating(false);
+    }
+  }
 
   const report = interview?.report;
   const score = report?.score ?? 0;
@@ -60,12 +80,28 @@ export function InterviewReportPage() {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={regenerate}
+            disabled={regenerating || !interview}
+            aria-busy={regenerating}
+            className="flex items-center gap-1.5 rounded-lg border border-mint-3/50 bg-mint-3/10 px-4 py-2 text-xs text-mint-2 disabled:cursor-wait disabled:opacity-60"
+          >
+            <RefreshCw size={14} className={regenerating ? "animate-spin" : ""} />
+            {regenerating ? "重新生成中…" : "重新生成复盘（测试）"}
+          </button>
           <button onClick={() => id && api.downloadReport(id)} className="flex items-center gap-1.5 rounded-lg border border-line-strong bg-row px-4 py-2 text-xs">
             <Upload size={14} className="text-mute" />
             导出复盘报告 ↗
           </button>
         </div>
       </header>
+
+      {regenerateError ? (
+        <div role="alert" className="border-b border-red-400/30 bg-red-500/10 px-6 py-2 text-xs text-red-200">
+          {regenerateError}
+        </div>
+      ) : null}
 
       <div className="min-h-0 flex-1 space-y-[18px] overflow-y-auto px-8 py-[22px]">
         <button onClick={() => navigate("/interview")} className="flex items-center gap-1.5 text-xs text-mute">

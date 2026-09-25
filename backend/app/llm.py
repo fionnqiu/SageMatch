@@ -1,4 +1,4 @@
-"""OpenAI Chat Completions client. Thinking and streaming are always on for text chat."""
+"""OpenAI Chat Completions client for streaming chat and structured JSON roles."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import httpx
 from app.config import get_settings
 from app.rag_config import get_rag_config
 
-# 文本对话只走 OpenAI Chat Completions。思考和流式写死开启，不进供应商配置。
+# 普通文本对话只走 OpenAI Chat Completions，思考和流式固定开启；结构化 JSON 角色走独立的非流式路径。
 CHAT_PROTOCOL = "openai_chat"
 
 
@@ -34,19 +34,118 @@ async def complete_json(
     top_p: float | None = None,
     protocol: str = CHAT_PROTOCOL,
 ) -> dict[str, Any]:
-    """Ask the model for a JSON object. Stub path returns a canned payload."""
-    raw = await complete_text(
-        system,
-        user,
-        max_tokens=max_tokens,
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        temperature=temperature,
-        top_p=top_p,
-        protocol=protocol,
-    )
-    return _extract_json(raw)
+    """Request a bounded JSON object without spending tokens on reasoning.
+
+    Structured roles such as scorer and coach need a complete object more than
+    they need token-by-token UI output. They therefore use a non-streaming call
+    with thinking disabled, while ordinary chat continues through the streaming
+    path below.
+    """
+    del protocol
+    finish_reason: str | None = None
+    try:
+        raw, finish_reason = await _complete_json_once(
+            system,
+            user,
+            max_tokens=max_tokens,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
+            use_response_format=True,
+        )
+        return _extract_json(raw)
+    except (ValueError, json.JSONDecodeError):
+        # Compatible providers can still emit malformed JSON. Retry once with a
+        # stricter instruction and no optional response_format field so providers
+        # that only partially implement the OpenAI contract get a second chance.
+        retry_user = (
+            f"{user}\n上一轮输出无法解析。请重新生成完整 JSON 对象，只输出 JSON，"
+            "不要 Markdown、解释、截断或额外文本。"
+        )
+        retry_raw, retry_finish_reason = await _complete_json_once(
+            system,
+            retry_user,
+            max_tokens=max_tokens,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            temperature=0.0,
+            top_p=top_p,
+            use_response_format=False,
+        )
+        try:
+            return _extract_json(retry_raw)
+        except (ValueError, json.JSONDecodeError) as exc:
+            reason = retry_finish_reason or finish_reason
+            if reason:
+                raise ValueError(f"LLM JSON response is invalid (finish_reason={reason})") from exc
+            raise
+
+
+async def _complete_json_once(
+    system: str,
+    user: str,
+    *,
+    max_tokens: int,
+    api_key: str | None,
+    base_url: str | None,
+    model: str | None,
+    temperature: float,
+    top_p: float | None,
+    use_response_format: bool,
+) -> tuple[str, str | None]:
+    """Make one non-streaming JSON request and return content plus finish reason."""
+    settings = get_settings()
+    gen = get_rag_config().generation
+    key = api_key if api_key is not None else settings.llm_api_key
+    url = base_url if base_url is not None else settings.llm_base_url
+    mdl = model or settings.llm_model
+    nucleus = gen.top_p if top_p is None else top_p
+    if not key:
+        raise RuntimeError("LLM_API_KEY is empty")
+
+    body: dict[str, Any] = {
+        "model": mdl,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+        # Scoring output must not share its token budget with hidden reasoning.
+        "enable_thinking": False,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+    }
+    if 0 < nucleus <= 1:
+        body["top_p"] = nucleus
+    if use_response_format:
+        body["response_format"] = {"type": "json_object"}
+
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    timeout = httpx.Timeout(180.0, connect=15.0, read=60.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        res = await client.post(f"{openai_root(url)}/chat/completions", headers=headers, json=body)
+        # Some OpenAI-compatible endpoints reject response_format even though
+        # they accept the rest of the request. Retry that request once without it.
+        if use_response_format and getattr(res, "status_code", 200) in {400, 404, 422}:
+            retry_body = {key: value for key, value in body.items() if key != "response_format"}
+            res = await client.post(f"{openai_root(url)}/chat/completions", headers=headers, json=retry_body)
+        res.raise_for_status()
+        data = res.json()
+
+    choices = data.get("choices") if isinstance(data, dict) else None
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    message = choice.get("message") if isinstance(choice, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list):
+        # A few compatible endpoints return content parts instead of one string.
+        content = "".join(
+            str(part.get("text") or part.get("content") or "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError(f"LLM returned no JSON content (finish_reason={finish_reason or 'unknown'})")
+    return content.strip(), str(finish_reason) if finish_reason else None
 
 
 async def complete_tool_call(
@@ -367,6 +466,13 @@ def _reasoning_details_text(raw: Any) -> str:
 
 
 def _extract_json(raw: str) -> dict[str, Any]:
+    """Extract strict JSON and repair only the common provider wrapper failure.
+
+    Some compatible endpoints wrap JSON in markdown fences or prepend prose;
+    those wrappers are safe to remove. Python-literal conversion is deliberately
+    excluded because it can silently accept malformed model output and weaken
+    the scorer/coach contract.
+    """
     text = raw.strip()
     fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
     if fenced:
@@ -374,7 +480,16 @@ def _extract_json(raw: str) -> dict[str, Any]:
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
         raise ValueError(f"LLM did not return JSON: {raw[:240]}")
-    return json.loads(text[start : end + 1])
+    payload = text[start : end + 1]
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        # A frequent Qwen response shape uses a trailing comma. Remove commas
+        # immediately before a closing object/array, then retry strict JSON.
+        repaired = re.sub(r",\s*([}\]])", r"\1", payload)
+        if repaired == payload:
+            raise exc
+        return json.loads(repaired)
 
 
 def _parse_embedding_vectors(data: Any) -> list[list[float]]:

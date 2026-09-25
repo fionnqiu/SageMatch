@@ -185,8 +185,7 @@ export function AdminMaterialsPage() {
   return (
     <div className="flex h-full flex-col bg-shell">
       <header className="flex h-12 items-center justify-between border-b border-line px-6 text-xs">
-        <span className="text-ink-2">系统运维与配置控制台 · 知识物料管理与切分</span>
-        <span className="text-dim">即时入库 · 删除立即失效</span>
+        <span className="font-medium text-ink-2">知识物料与分块</span>
       </header>
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-8 py-5">
         <div className="grid grid-cols-4 gap-4">

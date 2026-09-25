@@ -11,6 +11,15 @@
   --color-elevated: #131318;
   --color-card: #101014;
   --color-card-live: #0f1a17;
+  /* Interview hub status tones keep the three card states distinct without relying on color alone. */
+  --color-status-ready-card: #0f1b2e;
+  --color-status-ready-border: #2563eb;
+  --color-status-ready-badge: #1d4ed8;
+  --color-status-ready-text: #dbeafe;
+  --color-status-review-card: #2a171f;
+  --color-status-review-border: #9f5b72;
+  --color-status-review-badge: #8f435d;
+  --color-status-review-text: #ffe4ec;
   --color-line: #1c1c1f;
   --color-line-strong: #2e2e36;
   --color-ink: #fafafa;
@@ -56,6 +65,14 @@
   --color-elevated: #ffffff;
   --color-card: #ffffff;
   --color-card-live: #ecfdf5;
+  --color-status-ready-card: #eff6ff;
+  --color-status-ready-border: #93c5fd;
+  --color-status-ready-badge: #2563eb;
+  --color-status-ready-text: #eff6ff;
+  --color-status-review-card: #fff1f4;
+  --color-status-review-border: #f0a3b8;
+  --color-status-review-badge: #f8d7e0;
+  --color-status-review-text: #831843;
   --color-line: #e4e4e7;
   --color-line-strong: #d4d4d8;
   --color-ink: #18181b;
@@ -641,5 +658,4 @@ select.admin-input {
   font-size: 11px;
   color: var(--color-dim);
 }
-
 

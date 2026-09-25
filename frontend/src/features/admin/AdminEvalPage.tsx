@@ -21,8 +21,7 @@ export function AdminEvalPage() {
   return (
     <div className="flex h-full flex-col bg-shell">
       <header className="flex h-12 items-center justify-between border-b border-line px-6 text-xs">
-        <span className="text-ink-2">出题质量评测 · 评分一致性评测 · 历史留存</span>
-        <span className="text-dim">复用业务出题 / 复盘链路</span>
+        <span className="font-medium text-ink-2">出题与评分质检</span>
       </header>
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-8 py-5">
         <section className="space-y-2 rounded-xl border border-line bg-card p-4">

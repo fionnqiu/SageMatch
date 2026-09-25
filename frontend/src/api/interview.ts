@@ -68,6 +68,9 @@ export const interviewApi = {
       signal,
     }),
   endInterview: (id: string) => request<Interview>(`/api/interviews/${id}/end`, { method: "POST" }),
+  // Temporary QA hook: replace the persisted report and run the same async pipeline again.
+  regenerateReport: (id: string) =>
+    request<Interview>(`/api/interviews/${id}/report/regenerate`, { method: "POST" }),
   // 直接退出回到待开始，不生成复盘；后端会清理半场进度。
   abandonInterview: (id: string) => request<Interview>(`/api/interviews/${id}/abandon`, { method: "POST" }),
   deleteInterview: (id: string) => request<{ ok: string }>(`/api/interviews/${id}`, { method: "DELETE" }),

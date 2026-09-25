@@ -25,10 +25,30 @@ export function InterviewHubPage() {
   const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
-    api.interviews()
-      .then(setItems)
-      .catch(() => undefined)
-      .finally(() => setLoaded(true));
+    let cancelled = false;
+    let timer = 0;
+
+    async function loadInterviews() {
+      try {
+        const data = await api.interviews();
+        if (cancelled) return;
+        setItems(data);
+        setLoaded(true);
+        // Ending an interview stops the timer before the background report job finishes.
+        // Refresh only while an ended card has no report, then stop polling once it is ready.
+        if (data.some((item) => item.status === "ended" && !item.report)) {
+          timer = window.setTimeout(() => void loadInterviews(), 2500);
+        }
+      } catch {
+        if (!cancelled) setLoaded(true);
+      }
+    }
+
+    void loadInterviews();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   async function confirmDeleteInterview() {
@@ -48,6 +68,9 @@ export function InterviewHubPage() {
 
   async function openCard(item: Interview) {
     if (item.status === "ended") {
+      // The report route can render a waiting state, but the hub keeps this action
+      // disabled until the report has actually been persisted.
+      if (!item.report) return;
       navigate(`/interview/${item.id}/report`);
       return;
     }
@@ -136,22 +159,36 @@ export function InterviewHubPage() {
         <div className="grid min-h-0 grid-cols-3 gap-4">
           {rest.map((item) => {
             const ready = item.status === "ready" || item.status === "abandoned";
-            const ended = item.status === "ended";
+            const reviewing = item.status === "ended" && !item.report;
+            const ended = item.status === "ended" && Boolean(item.report);
             return (
+              // Keep each status color consistent across the card surface, badge, and action.
               <div
                 key={item.id}
                 className={`flex h-[248px] flex-col justify-between overflow-hidden rounded-[14px] border p-4 ${
-                  ready ? "border-forest-2/40 bg-card-live" : "border-line bg-card"
+                  reviewing
+                    ? "border-status-review-border bg-status-review-card"
+                    : ended
+                      ? "border-forest-2/40 bg-card-live"
+                      : ready
+                        ? "border-status-ready-border bg-status-ready-card"
+                        : "border-line bg-card"
                 }`}
               >
                 <div className="min-h-0 flex-1 space-y-2 overflow-hidden">
                   <div className="flex items-center justify-between">
                     <span
                       className={`rounded-full px-2.5 py-0.5 text-[10px] font-semibold ${
-                        ready ? "bg-forest text-mint-4" : "bg-chip text-mute"
+                        reviewing
+                          ? "bg-status-review-badge text-status-review-text"
+                          : ended
+                            ? "bg-forest text-mint-4"
+                            : ready
+                              ? "bg-status-ready-badge text-status-ready-text"
+                              : "bg-chip text-mute"
                       }`}
                     >
-                      {ended ? "已完成" : "待开始"}
+                      {reviewing ? "正在复盘" : ended ? "已完成" : "待开始"}
                     </span>
                     <span className="flex items-center gap-2">
                       {item.score != null ? <span className="text-base font-bold">{item.score.toFixed(1)}</span> : null}
@@ -166,7 +203,11 @@ export function InterviewHubPage() {
                   </div>
                   <div className="line-clamp-2 text-[15px] font-semibold">{item.title}</div>
                   <div className="text-[11px] text-dim">
-                    {ended ? `${formatWhen(item.ended_at)} 完成` : "基于岗位要求生成 · 预计时长 30 分钟"}
+                    {reviewing
+                      ? `${formatWhen(item.ended_at)} 结束 · 复盘生成中`
+                      : ended
+                        ? `${formatWhen(item.ended_at)} 完成`
+                        : "基于岗位要求生成 · 预计时长 30 分钟"}
                   </div>
                   <div className="flex h-5 gap-1.5 overflow-hidden">
                     {(item.tags || []).slice(0, 3).map((tag) => (
@@ -179,13 +220,18 @@ export function InterviewHubPage() {
                 </div>
                 <button
                   onClick={() => openCard(item)}
-                  className={`mt-3 rounded-lg border px-3 py-2 text-xs ${
-                    ready
-                      ? "border-forest-2/40 bg-forest font-semibold text-mint-4"
-                      : "border-line-strong bg-row text-ink-2"
+                  disabled={reviewing}
+                  className={`mt-3 rounded-lg border px-3 py-2 text-xs transition-colors ${
+                    reviewing
+                      ? "cursor-wait border-status-review-border bg-status-review-badge font-semibold text-status-review-text"
+                      : ended
+                        ? "border-forest-2/40 bg-forest font-semibold text-mint-4"
+                        : ready
+                          ? "border-status-ready-border bg-status-ready-badge font-semibold text-status-ready-text"
+                          : "border-line-strong bg-row text-ink-2"
                   }`}
                 >
-                  {ended ? "查看报告 ↗" : "开始面试 ➔"}
+                  {reviewing ? "正在生成复盘" : ended ? "查看报告 ↗" : "开始面试 ➔"}
                 </button>
               </div>
             );

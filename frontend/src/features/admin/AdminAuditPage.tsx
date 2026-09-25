@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { ChevronLeft, ChevronRight, Download } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api, type AuditLog, type CallLog } from "../../api";
 import { Select } from "../../components/Select";
@@ -143,6 +143,20 @@ export function AdminAuditPage() {
   const callPage = usePagedRows(calls);
   const auditPage = usePagedRows(audits);
 
+  async function exportLogs() {
+    try {
+      const blob = await api.exportLogs();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "sagematch-error-logs.log";
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "导出失败", "error");
+    }
+  }
+
   useEffect(() => {
     Promise.all([api.adminOverview(), api.callLogs(), api.auditLogs()])
       .then(([ov, c, a]) => {
@@ -162,8 +176,10 @@ export function AdminAuditPage() {
   return (
     <div className="flex h-full flex-col bg-shell">
       <header className="flex h-12 items-center justify-between border-b border-line px-6 text-xs">
-        <span className="text-ink-2">调用日志与操作留痕</span>
-        <span className="text-dim">本页不展示密钥</span>
+        <span className="font-medium text-ink-2">调用与安全审计</span>
+        <button type="button" onClick={exportLogs} className="flex items-center gap-1.5 rounded-md border border-line-strong px-2.5 py-1.5 text-ink-2">
+          <Download size={13} /> 导出错误日志
+        </button>
       </header>
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-8 py-5">
         <div className="grid grid-cols-3 gap-4">

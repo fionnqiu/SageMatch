@@ -47,8 +47,7 @@ export function AdminProvidersPage() {
   return (
     <div className="flex h-full flex-col bg-canvas">
       <header className="flex h-12 items-center justify-between border-b border-line px-6 text-xs">
-        <span className="text-ink-2">模型供应商池 · 按 Agent 角色绑定</span>
-        <span className="text-dim">密钥仅脱敏展示 · 切换角色后用户端无感</span>
+        <span className="font-medium text-ink-2">模型供应商接入</span>
       </header>
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-10 py-6">
         <section className="space-y-3 rounded-xl border border-line bg-card p-4">
@@ -668,4 +667,3 @@ function Field({ label, children, wide }: { label: string; children: ReactNode; 
     </div>
   );
 }
-

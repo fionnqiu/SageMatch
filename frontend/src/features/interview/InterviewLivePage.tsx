@@ -132,14 +132,17 @@ export function InterviewLivePage() {
   }, [turns.length]);
 
   useEffect(() => {
-    if (!prompt || !interview || interview.status !== "live") return;
+    // 流式文本尚未完成时不要把首个字符当成完整问题播报；等 streamingTurn 清除、
+    // 服务端完整 turn 写回后再触发一次 TTS，避免后续轮次被同一个 turn id 去重。
+    if (streamingTurn || !prompt || !interview || interview.status !== "live") return;
     if (lastSpoken.current === promptKey) return;
     lastSpoken.current = promptKey;
-    window.speechSynthesis?.cancel();
-    if (!window.speechSynthesis || typeof SpeechSynthesisUtterance === "undefined") {
+    const synthesis = window.speechSynthesis;
+    if (!synthesis || typeof SpeechSynthesisUtterance === "undefined") {
       setSpeaking(false);
       return;
     }
+    synthesis.cancel();
     const utter = new SpeechSynthesisUtterance(prompt);
     utter.lang = "zh-CN";
     utter.voice = selectChineseVoice();
@@ -150,8 +153,11 @@ export function InterviewLivePage() {
     utter.onend = () => setSpeaking(false);
     utter.onerror = () => setSpeaking(false);
     setSpeaking(true);
-    window.speechSynthesis.speak(utter);
-  }, [prompt, promptKey, interview?.status, speechVoices]);
+    // Chromium can leave the speech queue paused after several utterances; resume
+    // before each completed interviewer turn so ASR -> TTS remains repeatable.
+    synthesis.resume();
+    synthesis.speak(utter);
+  }, [prompt, promptKey, interview?.status, speechVoices, streamingTurn]);
 
   useEffect(() => () => {
     requestRef.current?.abort();
@@ -198,7 +204,6 @@ export function InterviewLivePage() {
       if (controller.signal.aborted) return;
       const next = await api.answerInterview(id, text, mode, controller.signal);
       if (requestRef.current !== controller) return;
-      setPendingTurn(null);
       const reply = [...(next.turns || [])].reverse().find((turn) => turn.role === "interviewer");
       if (reply) {
         // The answer endpoint currently returns JSON; reveal its persisted interviewer turn incrementally.
@@ -209,6 +214,9 @@ export function InterviewLivePage() {
         }
       }
       setStreamingTurn(null);
+      // Keep the optimistic candidate turn visible until the persisted interview replaces it.
+      // This preserves the question -> answer -> interviewer response order during streaming.
+      setPendingTurn(null);
       setInterview(next);
     } catch (err) {
       if (controller.signal.aborted) return;
@@ -428,7 +436,7 @@ export function InterviewLivePage() {
               <p className="text-sm leading-6 text-ink-2">{listening ? draft || "正在聆听…" : draft || interviewError}</p>
             </div>
           ) : null}
-          {busy ? (
+          {busy && !streamingTurn ? (
             <div className="interview-turn interview-turn--interviewer interview-turn--processing space-y-2" aria-live="polite">
               <div className="flex items-center gap-1.5 text-[11px] font-medium">
                 <span className="h-1.5 w-1.5 rounded-full bg-mint" />
